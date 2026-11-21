@@ -4,7 +4,7 @@ site/node_modules/
 site/dist/
 .playwright-mcp/
 *.tsbuildinfo
-*.png
+/*.png
 *.log
 .env
 .env.*
