@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "TAB RAID // MONSTER INVASION",
+  "version": "4.0.0",
+  "description": "Arcade finger-gun pixel-monster tab shooter. Aim with your webcam index finger and fold your thumb to hunt and archive browser tabs.",
+  "permissions": [
+    "tabs",
+    "bookmarks",
+    "storage"
+  ],
+  "icons": {
+    "32": "icon-32.png",
+    "128": "icon-128.png"
+  },
+  "action": {
+    "default_title": "Launch TAB RAID // MONSTER INVASION",
+    "default_icon": {
+      "32": "icon-32.png",
+      "128": "icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  }
+}

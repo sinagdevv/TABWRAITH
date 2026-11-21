@@ -1,0 +1,11 @@
+node_modules/
+dist/
+site/node_modules/
+site/dist/
+.playwright-mcp/
+*.tsbuildinfo
+*.png
+*.log
+.env
+.env.*
+.vercel
