@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "TAB RAID // MONSTER INVASION",
-  "version": "4.0.0",
-  "description": "Arcade finger-gun pixel-monster tab shooter. Aim with your webcam index finger and fold your thumb to hunt and archive browser tabs.",
+  "name": "TABWRAITH: Curse of the Open Tabs",
+  "version": "5.2.0",
+  "description": "Dark fantasy pixel RPG. Banish cursed browser tabs with a webcam finger-gun, mouse or Space. Tabs are bookmarked before closing in LIVE MODE.",
   "permissions": [
     "tabs",
+    "tabGroups",
     "bookmarks",
     "storage"
   ],
@@ -13,7 +14,7 @@
     "128": "icon-128.png"
   },
   "action": {
-    "default_title": "Launch TAB RAID // MONSTER INVASION",
+    "default_title": "Launch TABWRAITH",
     "default_icon": {
       "32": "icon-32.png",
       "128": "icon-128.png"

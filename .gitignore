@@ -9,3 +9,5 @@ site/dist/
 .env
 .env.*
 .vercel
+release-assets/
+.serena/

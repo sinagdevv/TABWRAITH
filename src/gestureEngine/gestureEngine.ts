@@ -8,6 +8,9 @@ export type ActionableGestureState =
   | 'NO HAND'
   | 'POSE NOT RECOGNIZED'
   | 'READY'
+  | 'FIST DETECTED'
+  | 'SPELL ARMED'
+  | 'SWORD READY'
   | 'FIRED';
 
 export interface GestureFrameResult {
@@ -222,12 +225,12 @@ export class GestureEngine {
 
     if (thumbFiredThisFrame || timeSinceFire < FIRED_BADGE_HOLD_MS) {
       statusLabel = 'FIRED';
-      detailHint = 'SHOT DISPATCHED // RAISE THUMB TO RE-COCK';
+      detailHint = 'SHOT DISPATCHED · RAISE THUMB TO RE-COCK';
     } else if (isFingerGunPose) {
       statusLabel = 'READY';
       detailHint = this.wasThumbCocked
-        ? 'LOCKED // FOLD THUMB DOWN TO FIRE'
-        : 'AIMING // RAISE THUMB TO COCK TRIGGER';
+        ? 'LOCKED · FOLD THUMB DOWN TO FIRE'
+        : 'AIMING · RAISE THUMB TO COCK TRIGGER';
     }
 
     const poseConfidence = isFingerGunPose

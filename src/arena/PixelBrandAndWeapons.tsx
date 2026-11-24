@@ -18,35 +18,35 @@ export const WEAPONS: WeaponSpec[] = [
   {
     id: 'starter-blaster',
     level: 1,
-    name: 'Starter Blaster',
+    name: 'Rustbound Relic',
     damage: 1,
     cost: 0,
-    laserColor: '#CCFF00',
+    laserColor: '#CA955C',
     coreColor: '#FFFFFF',
     beamWidth: 4,
-    tagline: 'Standard 1-HP pulse sidearm.',
+    tagline: 'Rune-etched relic. Fires a cursed bolt. 1 HP per shot.',
   },
   {
     id: 'double-barrel',
     level: 2,
-    name: 'Double Barrel',
+    name: 'Twin Hexcasters',
     damage: 2,
     cost: 600,
-    laserColor: '#2DD4BF',
-    coreColor: '#CCFF00',
+    laserColor: '#7BAA9B',
+    coreColor: '#E9DFCF',
     beamWidth: 7,
-    tagline: 'Twin-core scatter bolt. 2 HP per shot.',
+    tagline: 'Twin hex bolts, spectral and sharp. 2 HP per shot.',
   },
   {
     id: 'plasma-cannon',
     level: 3,
-    name: 'Plasma Cannon',
+    name: 'Abyssal Cannon',
     damage: 3,
     cost: 1500,
-    laserColor: '#FF5500',
-    coreColor: '#FACC15',
+    laserColor: '#B44653',
+    coreColor: '#CA955C',
     beamWidth: 10,
-    tagline: 'Heavy overcharged plasma rail. 3 HP per shot.',
+    tagline: 'Abyssal fire from a forbidden cannon. 3 HP per shot.',
   },
 ];
 
@@ -106,9 +106,9 @@ export const PixelWeaponSprite: React.FC<{ weaponId: WeaponId; size?: number }> 
         case 'P':
           return spec.laserColor;
         case 'S':
-          return '#475569';
+          return '#4A3F57';
         case 'W':
-          return '#F8FAFC';
+          return '#E9DFCF';
         case 'E':
           return spec.coreColor;
         default:
@@ -143,44 +143,43 @@ export const PixelWeaponSprite: React.FC<{ weaponId: WeaponId; size?: number }> 
 );
 
 /**
- * Original Pixel-Art TAB RAID Brand Mark (16x16 grid):
- * Combines a dark monster silhouette with an acid-lime arcade crosshair.
+ * Original TABWRAITH crest (16x16): cursed browser tab, spectral eye, crossed blades.
  */
-const BRAND_LOGO_GRID = [
-  '.......LL.......',
-  '.......LL.......',
-  '..MM..MMMM..MM..',
-  '..MMMMMMMMMMMM..',
-  '.MMMMLLLLLLMMMM.',
-  '.MMMLLMMMMLLMMM.',
-  '.MMMLMRMMRMLLMM.',
-  'LLLLLMMMMMMLLLLL',
-  'LLLLLMMMMMMLLLLL',
-  '.MMMLMMMMMMLLMM.',
-  '.MMMLLMMMMLLMMM.',
-  '.MMMMLLLLLLMMMM.',
-  '..MMM.M..M.MMM..',
-  '..MM........MM..',
-  '.......LL.......',
-  '.......LL.......',
+export const BRAND_LOGO_GRID = [
+  '..GGGGG.........',
+  '.GMMMMMG........',
+  'GGGGGGGGGGGGGGGG',
+  'GMMMMMMMMMMMMMMG',
+  'GMMMMMTTTTMMMMMG',
+  'GMMMTTBBBBTTMMMG',
+  'GMMTBBBRRBBBTMMG',
+  'GMMTBBRMMRBBTMMG',
+  'GMMTBBBRRBBBTMMG',
+  'GMMMTTBBBBTTMMMG',
+  'GMMMMMTTTTMMMMMG',
+  'GGGGGGGGGGGGGGGG',
+  'GB............BG',
+  '.BB..........BB.',
+  '..BB........BB..',
+  '...BB......BB...',
 ];
+
+export const LOGO_COLORS: Record<string, string> = {
+  G: '#CA955C',
+  M: '#211A29',
+  T: '#7BAA9B',
+  B: '#E9DFCF',
+  R: '#B44653',
+};
 
 export const PixelBrandLogo: React.FC<{ size?: number }> = React.memo(({ size = 34 }) => {
   const rects: React.ReactNode[] = [];
-  for (let y = 0; y < 16; y++) {
-    const row = BRAND_LOGO_GRID[y];
-    for (let x = 0; x < 16; x++) {
-      const ch = row[x];
-      let fill: string | null = null;
-      if (ch === 'L') fill = '#CCFF00';
-      else if (ch === 'M') fill = '#1E293B';
-      else if (ch === 'R') fill = '#FF3B5C';
-      if (fill) {
-        rects.push(<rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} fill={fill} />);
-      }
-    }
-  }
-
+  BRAND_LOGO_GRID.forEach((row, y) =>
+    [...row].forEach((ch, x) => {
+      const fill = LOGO_COLORS[ch];
+      if (fill) rects.push(<rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} fill={fill} />);
+    })
+  );
   return (
     <svg
       viewBox="0 0 16 16"
@@ -188,13 +187,8 @@ export const PixelBrandLogo: React.FC<{ size?: number }> = React.memo(({ size = 
       height={size}
       shapeRendering="crispEdges"
       className="pixel-brand-logo"
-      aria-label="TAB RAID Logo"
+      aria-label="TABWRAITH crest"
     >
-      <rect x={0} y={0} width={16} height={16} fill="#0A0C10" />
-      <rect x={0} y={0} width={16} height={1} fill="#CCFF00" />
-      <rect x={0} y={15} width={16} height={1} fill="#CCFF00" />
-      <rect x={0} y={0} width={1} height={16} fill="#CCFF00" />
-      <rect x={15} y={0} width={1} height={16} fill="#CCFF00" />
       {rects}
     </svg>
   );
