@@ -1483,3 +1483,6 @@ body,
 .dbg-locked .dbg-sprite { fill: rgba(202, 149, 92, 0.35); }
 .dbg-text { fill: #E9DFCF; font: 11px monospace; }
 .monster-unit { gap: 8px; }
+
+.debug-panel { position: absolute; left: 8px; bottom: 44px; z-index: 61; margin: 0; padding: 6px 8px; background: rgba(13, 11, 18, 0.88); border: 1px solid #6b4a28;
+  color: #E9DFCF; font: 11px/1.35 monospace; pointer-events: none; white-space: pre; }

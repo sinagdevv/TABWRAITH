@@ -292,6 +292,37 @@ export const Arena: React.FC = () => {
     return sprite ?? label ?? near;
   }, []);
 
+  // Lock history: the HUD shows which monster is locked; attacks use the lock from just before the
+  // trigger motion (thumb fold / palm open perturbs the fingertip), so a visible lock means damage.
+  const lockLogRef = useRef<Array<{ t: number; id: number | null }>>([]);
+  const noteLock = (id: number | null) => {
+    const log = lockLogRef.current;
+    log.push({ t: performance.now(), id });
+    if (log.length > 60) log.shift();
+  };
+  const lockAt = (t: number): number | null => {
+    let id: number | null = null;
+    for (const e of lockLogRef.current) if (e.t <= t) id = e.id;
+    return id;
+  };
+  const liveTarget = (id: number | null) => (id === null ? null : cardsRef.current.find((c) => c.tab.id === id && !c.isDestroying && !c.hidden) ?? null);
+  /** Target for a gesture attack: the lock ~140ms ago, else the lock right now. */
+  const resolveGestureTarget = (): number | null => {
+    const now = performance.now();
+    const before = liveTarget(lockAt(now - 140));
+    const current = liveTarget(lockedTabIdRef.current);
+    return (before ?? current)?.tab.id ?? null;
+  };
+
+  // development diagnostics (?debug): one record per attack, never per frame
+  const attackCountRef = useRef(0);
+  const [diag, setDiag] = useState<Record<string, string | number>>({});
+  const diagRef = useRef<Record<string, string | number>>({});
+  const recordAttack = (rec: Record<string, string | number>) => {
+    diagRef.current = { ...diagRef.current, ...rec };
+    if (DEBUG_HITBOX) console.info('[TW attack]', rec);
+  };
+
   // Direct DOM crosshair transform update — zero React re-render latency
   const updateCrosshairPosition = useCallback((stageX: number, stageY: number) => {
     crosshairRef.current = { x: stageX, y: stageY };
@@ -303,6 +334,7 @@ export const Arena: React.FC = () => {
     const nextLockedId = hit ? hit.tab.id : null;
     if (nextLockedId !== lockedTabIdRef.current) {
       lockedTabIdRef.current = nextLockedId;
+      noteLock(nextLockedId);
       setLockedTabId(nextLockedId);
     }
   }, [hitTest]);
@@ -407,6 +439,8 @@ export const Arena: React.FC = () => {
         beamFrom.y = originY;
       }
       const bladeEnd = style === 'blade' ? opts?.pathTo : undefined;
+      const attackN = ++attackCountRef.current;
+      const base = { n: attackN, source, style, aim: `${Math.round(aimStageX)},${Math.round(aimStageY)}`, target: hitCard?.tab.id ?? 'none', hpBefore: hitCard?.hp ?? '-', hpAfter: '-', dmg: weapon.damage };
       const beamId = `beam-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
       if (style === 'snap') soundFX.playSnapRelease();
@@ -414,6 +448,7 @@ export const Arena: React.FC = () => {
       else soundFX.playLaser(weapon.level);
 
       if (!hitCard || defeatedIdsSetRef.current.has(hitCard.tab.id)) {
+        recordAttack({ ...base, result: 'REJECTED', reason: hitCard ? 'target already defeated' : 'no monster under crosshair' });
         soundFX.playMiss();
         setCombo(1);
         setBursts((prev) => [
@@ -443,6 +478,7 @@ export const Arena: React.FC = () => {
       const targetCenterY = (hitCard.y / 100) * stageH;
       const dmg = weapon.damage;
       const nextHp = Math.max(0, hitCard.hp - dmg);
+      recordAttack({ ...base, result: 'ACCEPTED', reason: nextHp === 0 ? 'final blow' : 'damage', hpAfter: nextHp });
       const isBoss = hitCard.archetype.tier === 5;
 
       setLasers((prev) => [
@@ -464,6 +500,7 @@ export const Arena: React.FC = () => {
 
       // Legion bosses are visual only: a shot toggles expand/collapse, never damages or closes a tab
       if (hitCard.squad) {
+        recordAttack({ ...base, result: 'REJECTED', reason: 'legion boss only toggles' });
         toggleSquad(hitCard.squad.groupId);
         soundFX.playGunReady();
         return;
@@ -650,6 +687,7 @@ export const Arena: React.FC = () => {
       const nextLockedId = hit ? hit.tab.id : null;
       if (nextLockedId !== lockedTabIdRef.current) {
         lockedTabIdRef.current = nextLockedId;
+        noteLock(nextLockedId);
         setLockedTabId(nextLockedId);
       }
 
@@ -664,6 +702,23 @@ export const Arena: React.FC = () => {
           out.push({ id, sx: r.left - sr.left, sy: r.top - sr.top, sw: r.width, sh: r.height, ex: e.left - sr.left, ey: e.top - sr.top, ew: e.width, eh: e.height });
         });
         setDebugRects(out);
+      }
+
+      if (DEBUG_HITBOX && Math.round(now / 16) % 8 === 0) {
+        const f = lastFrameRef.current;
+        const lockId = lockedTabIdRef.current;
+        const lc = lockId === null ? null : cardsRef.current.find((c) => c.tab.id === lockId);
+        setDiag({
+          ...diagRef.current,
+          hand: f?.handDetected ? 'YES' : 'NO',
+          gesture: !f || !f.handDetected ? 'IDLE' : f.statusLabel === 'FIRED' ? 'FIRED' : READY_LABELS.has(f.statusLabel) ? 'READY' : 'IDLE',
+          cocked: f?.thumbCocked ? 'yes' : 'no',
+          attacks: attackCountRef.current,
+          crosshair: `${Math.round(crosshairRef.current.x)},${Math.round(crosshairRef.current.y)}`,
+          lock: lockId ?? 'none',
+          lockHp: lc ? `${lc.hp}/${lc.maxHp}` : '-',
+          thumb: f?.thumbClearance !== undefined ? `clr ${f.thumbClearance.toFixed(2)} ext ${(f.thumbExtension ?? 0).toFixed(2)}  cocks ${gestureEngineRef.current.stats.cocks} fires ${gestureEngineRef.current.stats.fires} foldNoCock ${gestureEngineRef.current.stats.foldsWithoutCock} drops ${gestureEngineRef.current.stats.poseDrops}` : '-',
+        });
       }
 
       const wallNow = Date.now();
@@ -724,6 +779,7 @@ export const Arena: React.FC = () => {
 
   // One landmark frame -> gesture state, crosshair and attacks. Used by the camera loop (and by the
   // ?debug synthetic-landmark test hook), so tests exercise the real combat path.
+  const lastFrameRef = useRef<GestureFrameResult | null>(null);
   const lastStatusRef = useRef<string>('');
   const lastCockedRef = useRef<boolean>(false);
   const handleHandFrame = (
@@ -783,14 +839,18 @@ export const Arena: React.FC = () => {
         };
 
         // Both casts hit whatever the crosshair currently targets (one target, one action)
+        if (fired && !raidStartedRef.current) {
+          setStatusBanner('PRESS START HUNT TO ATTACK');
+          recordAttack({ n: ++attackCountRef.current, source: 'hand', style: burst?.cast ? 'snap' : 'blade', result: 'REJECTED', reason: 'hunt not started' });
+        }
         if (raidStartedRef.current && aim) {
           const { w: stageW, h: stageH } = getStageSize();
           if (burst?.cast) {
-            fireShotRef.current(burst.cast.x * stageW, burst.cast.y * stageH, 'hand', { style: 'snap' });
+            fireShotRef.current(burst.cast.x * stageW, burst.cast.y * stageH, 'hand', { style: 'snap', tabId: resolveGestureTarget() ?? undefined });
           } else if (sword?.slash) {
             const sx = sword.slash.x * stageW;
             const sy = sword.slash.y * stageH;
-            const target = hitTest(sx, sy);
+            const target = liveTarget(resolveGestureTarget()) ?? hitTest(sx, sy);
             const cx = target ? (target.x / 100) * stageW : sx;
             const cy = target ? (target.y / 100) * stageH : sy;
             fireShotRef.current(sx, sy, 'hand', {
@@ -803,6 +863,7 @@ export const Arena: React.FC = () => {
         }
       }
 
+      lastFrameRef.current = frameResult;
       if (canvas) {
         drawHandLandmarks(
           canvas,
@@ -825,8 +886,20 @@ export const Arena: React.FC = () => {
 
         updateCrosshairPosition(nextX, nextY);
 
-        if (mode === 'hexcaster' && frameResult.thumbFiredThisFrame && raidStartedRef.current) {
-          fireShotRef.current(nextX, nextY, 'hand');
+        if (mode === 'hexcaster' && frameResult.thumbFiredThisFrame) {
+          if (!raidStartedRef.current) {
+            setStatusBanner('PRESS START HUNT TO ATTACK');
+            recordAttack({ n: ++attackCountRef.current, source: 'hand', style: 'bolt', result: 'REJECTED', reason: 'hunt not started' });
+          } else {
+            // __noLatch (debug only) reproduces the old behaviour: shoot at the current, already nudged, crosshair
+            const latch = !(DEBUG_HITBOX && (window as unknown as { __noLatch?: boolean }).__noLatch);
+            fireShotRef.current(
+              (latch ? frameResult.fireAimX ?? frameResult.crosshairX : frameResult.crosshairX) * getStageSize().w,
+              (latch ? frameResult.fireAimY ?? frameResult.crosshairY : frameResult.crosshairY) * getStageSize().h,
+              'hand',
+              { tabId: latch ? resolveGestureTarget() ?? undefined : undefined }
+            );
+          }
         }
       }
 
@@ -836,6 +909,7 @@ export const Arena: React.FC = () => {
         frameResult.thumbCocked !== lastCockedRef.current ||
         frameResult.thumbFiredThisFrame
       ) {
+        if (DEBUG_HITBOX) console.info('[TW gesture]', mode, frameResult.statusLabel, frameResult.thumbCocked ? 'cocked' : 'not cocked', frameResult.thumbFiredThisFrame ? 'FIRE' : '');
         lastStatusRef.current = frameResult.statusLabel;
         lastCockedRef.current = frameResult.thumbCocked;
         setGestureState(frameResult);
@@ -848,6 +922,13 @@ export const Arena: React.FC = () => {
       (window as unknown as Record<string, unknown>).__tabwraithTest = {
         feed: (lm: Parameters<GestureEngine['processLandmarks']>[0], t: number) => handleHandFrameRef.current(lm, t),
         setRaidStarted: () => setRaidStarted(true),
+        grantCredits: (n: number) => setCredits((c) => c + n),
+        lastAttack: () => diagRef.current,
+        hitMs: (n: number) => {
+          const t0 = performance.now();
+          for (let i = 0; i < n; i++) hitTest(300 + (i % 50), 300);
+          return (performance.now() - t0) / n;
+        },
       };
     }
   }, []);
@@ -1049,6 +1130,7 @@ export const Arena: React.FC = () => {
 
   // Stage mouse aiming & click fallback (direct DOM crosshair update)
   const handleStageMouseMove = (e: React.MouseEvent<HTMLElement>) => {
+    if (e.movementX === 0 && e.movementY === 0) return; // synthetic move from animated monsters under a still cursor
     const rect = e.currentTarget.getBoundingClientRect();
     const localX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
     const localY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
@@ -1628,6 +1710,15 @@ export const Arena: React.FC = () => {
             );
           })}
 
+          {DEBUG_HITBOX && (
+            <pre className="debug-panel" data-testid="debug-panel">
+{`hand ${diag.hand ?? '-'}   gesture ${diag.gesture ?? '-'}   thumb cocked ${diag.cocked ?? '-'}
+crosshair ${diag.crosshair ?? '-'}   lock ${diag.lock ?? '-'} (${diag.lockHp ?? '-'})
+${diag.thumb ?? ''}
+attacks ${diag.attacks ?? 0}  last: ${diag.source ?? '-'} ${diag.style ?? ''} ${diag.result ?? '-'} (${diag.reason ?? '-'})
+  aim ${diag.aim ?? '-'} target/tab ${diag.target ?? '-'}  dmg ${diag.dmg ?? '-'}  hp ${diag.hpBefore ?? '-'} -> ${diag.hpAfter ?? '-'}`}
+            </pre>
+          )}
           {DEBUG_HITBOX && (
             <svg className="arena-vfx-svg debug-hitbox" aria-hidden="true" data-testid="debug-hitbox">
               {debugRects.map((d) => (

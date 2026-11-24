@@ -1,6 +1,7 @@
 // Synthetic-landmark checks for Soul Burst and Wraithblade. Run: node scripts/gesture-test.ts
 import assert from 'node:assert/strict';
 import { BurstDetector, SwordDetector, classifyPose } from '../src/gestureEngine/combatGestures.ts';
+import { GestureEngine } from '../src/gestureEngine/gestureEngine.ts';
 
 type LM = { x: number; y: number; z: number };
 type Fingers = [boolean, boolean, boolean, boolean]; // index, middle, ring, pinky extended
@@ -141,4 +142,65 @@ t('sword: works rotated 40 degrees', () => {
   run(s, c, hand(FIST, r), 200, 'slash');
   assert.equal(run(s, c, hand(SWORD, r), 800, 'slash'), 1);
 });
+// ---- Hexcaster (finger gun engine) ----
+function gun(raised: boolean, at = { x: 0.5, y: 0.7 }, indexCurled = false): LM[] {
+  const pts = hand(indexCurled ? FIST : GUN, 0, at);
+  const { x: cx, y: cy } = at;
+  if (raised) { pts[3] = { x: cx - 0.1, y: cy - 0.01, z: 0 }; pts[4] = { x: cx - 0.14, y: cy - 0.04, z: 0 }; }
+  else { pts[3] = { x: cx - 0.04, y: cy + 0.03, z: 0 }; pts[4] = { x: cx - 0.035, y: cy, z: 0 }; }
+  return pts;
+}
+function engineRun(e: GestureEngine, clock: { t: number }, lm: LM[] | null, ms: number) {
+  let fires = 0;
+  for (let el = 0; el < ms; el += 33) {
+    clock.t += 33;
+    if (e.processLandmarks(lm, clock.t).thumbFiredThisFrame) fires++;
+  }
+  return fires;
+}
+t('gun: cock then fold fires exactly once, holding the fold never repeats', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  engineRun(e, c, gun(false), 300);
+  engineRun(e, c, gun(true), 400);
+  assert.equal(engineRun(e, c, gun(false), 3000), 1);
+});
+t('gun: folding without ever cocking does not fire (counted for diagnostics)', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  assert.equal(engineRun(e, c, gun(false), 1500), 0);
+  assert.ok(e.stats.foldsWithoutCock >= 1);
+});
+t('gun: a pose dropout during the fold cannot swallow the shot', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  engineRun(e, c, gun(true), 500);
+  assert.equal(engineRun(e, c, gun(false, { x: 0.5, y: 0.7 }, true), 200), 1);
+});
+t('gun: tracking lost for over 300ms drops the cocked state', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  engineRun(e, c, gun(true), 500);
+  engineRun(e, c, null, 400);
+  assert.equal(engineRun(e, c, gun(false), 600), 0);
+});
+t('gun: re-cocking inside the cooldown waits, then fires once', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  engineRun(e, c, gun(true), 400);
+  assert.equal(engineRun(e, c, gun(false), 200), 1);
+  engineRun(e, c, gun(true), 100);
+  assert.equal(engineRun(e, c, gun(false), 1200), 1);
+});
+t('gun: fire aim is latched from before the thumb-fold nudge', () => {
+  const e = new GestureEngine(), c = { t: 1000 };
+  engineRun(e, c, gun(true), 700);
+  const settled = e.processLandmarks(gun(true), (c.t += 33)).crosshairX;
+  const nudged = { x: 0.5 + 0.06, y: 0.7 + 0.06 };
+  let fireX: number | undefined;
+  let curX = 0;
+  for (let i = 0; i < 6 && fireX === undefined; i++) {
+    const r = e.processLandmarks(gun(false, nudged), (c.t += 33));
+    curX = r.crosshairX;
+    if (r.thumbFiredThisFrame) fireX = r.fireAimX;
+  }
+  assert.ok(fireX !== undefined, 'shot fired');
+  assert.ok(Math.abs(fireX! - settled) < 0.02, `latched ${fireX} vs settled ${settled}, current ${curX}`);
+});
+
 console.log(`\n${passed} gesture tests passed (synthetic landmarks; real webcam UNTESTED)`);

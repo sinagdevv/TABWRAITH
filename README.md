@@ -107,7 +107,7 @@ npm run typecheck
 node scripts/gesture-test.ts   # synthetic-landmark gesture tests (Node 22.6+ or newer)
 ```
 
-Open the dev URL with `?debug` to show a hitbox overlay and a test hook that accepts synthetic hand landmarks. It is intended for development only.
+Open the arena with `?debug=1` (for the installed extension: `chrome-extension://<id>/index.html?debug=1`) to show a development overlay: sprite boxes and hit pads, the crosshair position, the locked monster, the finger-gun thumb numbers and cock/fire counters, and one line per attack (accepted or rejected, the reason, target tab ID, HP before and after). Attacks and gesture transitions are also logged to the console, one line each. The page also exposes a hook for feeding synthetic hand landmarks. It is intended for development only.
 
 ## Building the extension
 
