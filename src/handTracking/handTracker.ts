@@ -99,8 +99,8 @@ export function drawHandLandmarks(
 
   if (!landmarks || landmarks.length < 21) return;
 
-  const primaryColor = isFingerGunPose ? '#CCFF00' : '#38BDF8';
-  const triggerColor = thumbCocked ? '#CCFF00' : '#FF5500';
+  const primaryColor = isFingerGunPose ? '#7BAA9B' : '#E9DFCF';
+  const triggerColor = thumbCocked ? '#7BAA9B' : '#B44653';
 
   ctx.save();
   ctx.translate(width, 0);
@@ -131,10 +131,10 @@ export function drawHandLandmarks(
     ctx.beginPath();
     ctx.arc(x, y, isIndexTip ? 7 : isThumbTip ? 6 : 3, 0, Math.PI * 2);
     ctx.fillStyle = isIndexTip
-      ? '#CCFF00'
+      ? '#7BAA9B'
       : isThumbTip
       ? triggerColor
-      : '#0A0C10';
+      : '#0D0B12';
     ctx.fill();
     ctx.lineWidth = isIndexTip || isThumbTip ? 2 : 1.5;
     ctx.strokeStyle = isIndexTip ? '#FFFFFF' : primaryColor;

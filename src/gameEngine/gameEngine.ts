@@ -1,4 +1,4 @@
-import { RaidTab, ThreatTier } from '../tabManager/tabManager';
+import { RaidTab, RaidGroup, ThreatTier } from '../tabManager/tabManager';
 import { MONSTER_ARCHETYPES, MonsterArchetypeSpec } from '../arena/PixelMonsterSprite';
 
 export interface FloatingTargetCard {
@@ -19,6 +19,8 @@ export interface FloatingTargetCard {
   hitFlashUntil: number;
   recoilOffsetY: number;
   isDestroying?: boolean;
+  hidden?: boolean; // member of a collapsed legion: not drawn, not targetable
+  squad?: { groupId: number; title: string; color: string; total: number }; // legion boss marker (visual only)
 }
 
 export interface LaserBeamEffect {
@@ -32,6 +34,7 @@ export interface LaserBeamEffect {
   coreColor: string;
   width: number;
   createdAt: number;
+  style?: 'bolt' | 'snap' | 'blade';
 }
 
 export interface ParticleBurst {
@@ -51,11 +54,11 @@ export interface ParticleBurst {
 }
 
 const ARCHETYPE_DEATH_COLORS: Record<ThreatTier, string[]> = {
-  1: ['#A3E635', '#CCFF00', '#4D7C0F', '#FFFFFF'],
-  2: ['#38BDF8', '#00F5D4', '#FACC15', '#FFFFFF'],
-  3: ['#F59E0B', '#FB923C', '#EF4444', '#FFFFFF'],
-  4: ['#E2E8F0', '#FF3B5C', '#94A3B8', '#CCFF00'],
-  5: ['#FF4D4D', '#CCFF00', '#FACC15', '#FFFFFF'],
+  1: ['#A3E635', '#CA955C', '#4D7C0F', '#FFFFFF'],
+  2: ['#7BAA9B', '#7BAA9B', '#CA955C', '#FFFFFF'],
+  3: ['#CA955C', '#FB923C', '#EF4444', '#FFFFFF'],
+  4: ['#E2E8F0', '#B44653', '#A89B8C', '#CA955C'],
+  5: ['#B44653', '#CA955C', '#CA955C', '#FFFFFF'],
 };
 
 export function createFloatingCards(tabs: RaidTab[]): FloatingTargetCard[] {
@@ -102,7 +105,7 @@ export function createFloatingCards(tabs: RaidTab[]): FloatingTargetCard[] {
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed * 0.78,
       widthPx: tier === 5 ? 196 : 178,
-      heightPx: tier === 5 ? 164 : 148,
+      heightPx: tier === 5 ? 222 : 206, // full footprint: HP plate + sprite + nameplate
       phase: (seed % 12) * 0.6,
       floatAmpX: tier === 2 ? 1.35 : 0.65,
       floatAmpY: tier === 1 ? 1.15 : 0.75,
@@ -115,28 +118,33 @@ export function createFloatingCards(tabs: RaidTab[]): FloatingTargetCard[] {
 export function stepFloatingCards(
   cards: FloatingTargetCard[],
   dtSeconds: number,
-  elapsedSeconds: number
+  elapsedSeconds: number,
+  stageW = 950,
+  stageH = 640
 ): FloatingTargetCard[] {
-  const minX = 13;
-  const maxX = 87;
-  const minY = 17;
-  const maxY = 81;
-
-  // Stronger separation pass so larger monsters and nameplates never overlap
+  // Separation and bounds work in real pixels using each card's full footprint, so HP plates,
+  // sprites and nameplates of neighbours stop overlapping and nothing leaves the arena.
   return cards.map((card, i) => {
-    if (card.isDestroying) return card;
+    if (card.isDestroying || card.hidden) return card;
+    const halfW = card.widthPx / 2;
+    const halfH = card.heightPx / 2;
+    const minX = ((halfW + 8) / stageW) * 100;
+    const maxX = 100 - minX;
+    const minY = ((halfH + 8) / stageH) * 100;
+    const maxY = Math.max(minY + 1, 100 - ((halfH + 36) / stageH) * 100); // keep clear of the banner
     let pushX = 0;
     let pushY = 0;
     for (let j = 0; j < cards.length; j++) {
-      if (i === j || cards[j].isDestroying) continue;
-      const dx = card.x - cards[j].x;
-      const dy = (card.y - cards[j].y) * 1.15;
-      const dist = Math.hypot(dx, dy);
-      const minSep = 23.5; // percentage units
-      if (dist > 0.01 && dist < minSep) {
-        const force = ((minSep - dist) / minSep) * 11.0;
-        pushX += (dx / dist) * force * dtSeconds;
-        pushY += (dy / dist) * force * dtSeconds;
+      const o = cards[j];
+      if (i === j || o.isDestroying || o.hidden) continue;
+      const dxp = ((card.x - o.x) / 100) * stageW || (i > j ? 0.5 : -0.5);
+      const dyp = ((card.y - o.y) / 100) * stageH || (i > j ? 0.5 : -0.5);
+      const overlapX = (halfW + o.widthPx / 2) * 0.94 - Math.abs(dxp);
+      const overlapY = (halfH + o.heightPx / 2) * 0.94 - Math.abs(dyp);
+      if (overlapX > 0 && overlapY > 0) {
+        // resolve along the axis with the smaller penetration
+        if (overlapX < overlapY) pushX += (Math.sign(dxp) * overlapX * 5 * dtSeconds * 100) / stageW;
+        else pushY += (Math.sign(dyp) * overlapY * 5 * dtSeconds * 100) / stageH;
       }
     }
 
@@ -192,7 +200,7 @@ export function findTargetAtPoint(
   let bestDist = Infinity;
 
   for (const card of cards) {
-    if (card.isDestroying) continue;
+    if (card.isDestroying || card.hidden) continue;
 
     const centerX = (card.x / 100) * stageW;
     const centerY = (card.y / 100) * stageH;
@@ -214,6 +222,74 @@ export function findTargetAtPoint(
   }
 
   return bestMatch;
+}
+
+/**
+ * First active monster whose padded hitbox the swipe segment passes through (nearest to the start).
+ * Samples the segment, which is plenty for a ~30px-padded 170px hitbox.
+ */
+export function findTargetOnSegment(
+  cards: FloatingTargetCard[],
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  stageW: number,
+  stageH: number,
+  pad = 30
+): FloatingTargetCard | null {
+  const steps = Math.max(2, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 12));
+  for (let i = 0; i <= steps; i++) {
+    const x = x0 + ((x1 - x0) * i) / steps;
+    const y = y0 + ((y1 - y0) * i) / steps;
+    const hit = findTargetAtPoint(cards, x, y, stageW, stageH, pad);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Reconciles the arena with the browser: keeps existing monster state (HP, position) for tabs that
+ * still exist, adds new tabs, drops tabs that vanished, and keeps one visual legion boss per group.
+ * Group ids are session-scoped and only used as in-memory keys here.
+ */
+export function mergeCards(
+  prev: FloatingTargetCard[],
+  tabs: RaidTab[],
+  groups: RaidGroup[],
+  collapsed: Set<number>
+): FloatingTargetCard[] {
+  const liveGroupIds = new Set(groups.map((g) => g.id));
+  const tabById = new Map(tabs.map((t) => [t.id, { ...t, groupId: t.groupId !== undefined && liveGroupIds.has(t.groupId) ? t.groupId : undefined }]));
+  const prevTabs = new Map(prev.filter((c) => !c.squad).map((c) => [c.tab.id, c]));
+
+  const keptTabs: FloatingTargetCard[] = [];
+  for (const c of prev) {
+    if (c.squad) continue;
+    const fresh = tabById.get(c.tab.id);
+    if (c.isDestroying) keptTabs.push(c);
+    else if (fresh) keptTabs.push({ ...c, tab: { ...c.tab, ...fresh }, hidden: fresh.groupId !== undefined && collapsed.has(fresh.groupId) });
+  }
+  const fresh = createFloatingCards(tabs.filter((t) => !prevTabs.has(t.id)).map((t) => tabById.get(t.id)!)).map((c) => ({
+    ...c,
+    hidden: c.tab.groupId !== undefined && collapsed.has(c.tab.groupId),
+  }));
+  const tabCards = [...keptTabs, ...fresh];
+
+  const squads: FloatingTargetCard[] = [];
+  for (const g of groups) {
+    const members = tabCards.filter((c) => c.tab.groupId === g.id && !c.isDestroying).length;
+    if (members === 0) continue;
+    const existing = prev.find((c) => c.squad?.groupId === g.id);
+    const squad = { groupId: g.id, title: g.title, color: g.color, total: Math.max(members, existing?.squad?.total ?? 0) };
+    if (existing) {
+      squads.push({ ...existing, squad });
+    } else {
+      const pseudo: RaidTab = { id: -g.id - 1, title: g.title, url: '', domain: 'LEGION', estThreatTier: 5 };
+      squads.push({ ...createFloatingCards([pseudo])[0], hp: 0, maxHp: 0, points: 0, squad });
+    }
+  }
+  return [...squads, ...tabCards];
 }
 
 export function createParticleBurst(

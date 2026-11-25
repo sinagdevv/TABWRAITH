@@ -7,16 +7,35 @@ import {
   restoreClosedTab,
   spawnDemoRealTabs,
   isChromeExtensionEnv,
+  archiveAndCloseMany,
+  subscribeTabChanges,
+  setNativeGroupCollapsed,
+  RaidGroup,
 } from '../tabManager/tabManager';
+import {
+  VaultSession,
+  listVault,
+  saveGroupSession,
+  deleteSession,
+  restoreSession,
+} from '../tabManager/tabVault';
+import { LegionsPanel, LegionInfo, LegionCrest, legionColor } from './Legions';
 import {
   FloatingTargetCard,
   LaserBeamEffect,
   ParticleBurst,
   createFloatingCards,
+  mergeCards,
   stepFloatingCards,
   findTargetAtPoint,
   createParticleBurst,
 } from '../gameEngine/gameEngine';
+import { Battlefield } from './Battlefield';
+import { RelicSelector, FaceStatus } from './RelicSelector';
+import { FaceRelicController, FaceStats } from '../handTracking/faceRelics';
+import { RelicId, RELIC_BY_ID } from '../handTracking/relics';
+import { CombatMode, COMBAT_MODES, CombatSelector } from './CombatModes';
+import { BurstDetector, SwordDetector } from '../gestureEngine/combatGestures';
 import { soundFX } from '../gameEngine/soundFX';
 import {
   GestureEngine,
@@ -38,6 +57,34 @@ import {
   PixelBrandLogo,
 } from './PixelBrandAndWeapons';
 
+const HIT_PAD_PX = 14; // forgiving pad around a rendered sprite
+const HIT_NEAR_PX = 42; // nearest-sprite fallback radius for webcam aiming
+const DEBUG_HITBOX = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug');
+
+const READY_LABELS = new Set<string>(['READY', 'SPELL ARMED', 'SWORD READY']);
+
+const beamTtl = (l: LaserBeamEffect) => (l.style === 'snap' || l.style === 'blade' ? 380 : 210);
+
+const CORNER_GRID = ['GGGGGGG', 'GBBBBBB', 'GBGGGGB', 'GBGTTGB', 'GBGTGGB', 'GBGGGBM', 'GBBBBMM'];
+const CORNER_FILL: Record<string, string> = { G: '#CA955C', B: '#6B4A28', M: '#15101c', T: 'var(--mirror-gem)' };
+
+const MirrorCorner: React.FC<{ className: string }> = React.memo(({ className }) => (
+  <svg className={`mirror-corner ${className}`} viewBox="0 0 7 7" shapeRendering="crispEdges" aria-hidden="true">
+    {CORNER_GRID.flatMap((row, y) =>
+      [...row].map((ch, x) => (
+        <rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} fill={CORNER_FILL[ch]} className={ch === 'T' ? 'mirror-gem' : undefined} />
+      ))
+    )}
+  </svg>
+));
+
+interface ShotOpts {
+  style?: 'bolt' | 'snap' | 'blade';
+  tabId?: number;
+  pathFrom?: { x: number; y: number };
+  pathTo?: { x: number; y: number };
+}
+
 export const Arena: React.FC = () => {
   // Game & Mode states
   const [raidStarted, setRaidStarted] = useState<boolean>(false);
@@ -51,13 +98,23 @@ export const Arena: React.FC = () => {
   const [combo, setCombo] = useState<number>(1);
   const [closedHistory, setClosedHistory] = useState<ClosedTabRecord[]>([]);
   const [statusBanner, setStatusBanner] = useState<string>(
-    'SAFE MODE ACTIVE — MONSTER DEFEATS ARE SIMULATED UNTIL LIVE MODE IS ARMED'
+    'SAFE MODE ACTIVE — DEFEATS ARE SIMULATED UNTIL LIVE MODE IS ARMED'
   );
   const [muted, setMuted] = useState<boolean>(false);
   const [spriteFrame, setSpriteFrame] = useState<0 | 1>(0);
   const [screenShake, setScreenShake] = useState<'none' | 'light' | 'boss'>('none');
   const [crosshairRecoil, setCrosshairRecoil] = useState<boolean>(false);
   const [camExpanded, setCamExpanded] = useState<boolean>(false);
+
+  // Cursed Legions (native tab groups) & Soul Archive
+  const [groups, setGroups] = useState<RaidGroup[]>([]);
+  const groupsRef = useRef<RaidGroup[]>([]);
+  groupsRef.current = groups;
+  const collapsedRef = useRef<Set<number>>(new Set()); // arena-side collapse, session-scoped group ids
+  const [legionsOpen, setLegionsOpen] = useState<boolean>(false);
+  const [sessions, setSessions] = useState<VaultSession[]>([]);
+  const [legionBusy, setLegionBusy] = useState<boolean>(false);
+  const legionBusyRef = useRef<boolean>(false);
 
   // Armory & Popover states
   const [equippedWeaponId, setEquippedWeaponId] = useState<WeaponId>('starter-blaster');
@@ -98,6 +155,8 @@ export const Arena: React.FC = () => {
   const controlSourceRef = useRef<'mouse' | 'hand'>('mouse');
 
   const [lasers, setLasers] = useState<LaserBeamEffect[]>([]);
+  // development only: open index.html?debug to see sprite boxes, hit pads, crosshair and lock
+  const [debugRects, setDebugRects] = useState<Array<{ id: number; sx: number; sy: number; sw: number; sh: number; ex: number; ey: number; ew: number; eh: number }>>([]);
   const [bursts, setBursts] = useState<ParticleBurst[]>([]);
 
   // Refs for zero-lag direct DOM manipulation & animation loops
@@ -133,13 +192,135 @@ export const Arena: React.FC = () => {
   const streamRef = useRef<MediaStream | null>(null);
   const gestureEngineRef = useRef<GestureEngine>(new GestureEngine());
   const fireShotRef = useRef<
-    (aimStageX: number, aimStageY: number, source: 'hand' | 'mouse' | 'keyboard') => void
+    (aimStageX: number, aimStageY: number, source: 'hand' | 'mouse' | 'keyboard', opts?: ShotOpts) => void
   >(() => {});
+
+  // Hero Relics (cosmetic face overlay on the shared webcam stream)
+  const [relic, setRelic] = useState<RelicId | 'off'>(() => {
+    try {
+      const v = localStorage.getItem('tabRaidRelic');
+      return v && v in RELIC_BY_ID ? (v as RelicId) : 'off';
+    } catch {
+      return 'off';
+    }
+  });
+  const [faceSeen, setFaceSeen] = useState<boolean>(false);
+  const [faceStats, setFaceStats] = useState<FaceStats | null>(null);
+  const faceCtlRef = useRef<FaceRelicController>(new FaceRelicController());
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const selectRelic = useCallback((v: RelicId | 'off') => {
+    setRelic(v);
+    try {
+      localStorage.setItem('tabRaidRelic', v);
+    } catch {
+      // preference simply isn't remembered
+    }
+    if (v !== 'off') soundFX.playMaskSelect(RELIC_BY_ID[v].notes);
+    else soundFX.playCombatSwitch();
+  }, []);
+
+  // Combat style: only the selected style receives gesture input
+  const [combatMode, setCombatMode] = useState<CombatMode>('hexcaster');
+  const combatModeRef = useRef<CombatMode>('hexcaster');
+  const burstRef = useRef(new BurstDetector());
+  const swordRef = useRef(new SwordDetector());
+  const firedUntilRef = useRef(0);
+
+  const selectCombatMode = useCallback((m: CombatMode) => {
+    if (m === combatModeRef.current) return;
+    combatModeRef.current = m;
+    setCombatMode(m);
+    gestureEngineRef.current.reset();
+    burstRef.current.reset();
+    swordRef.current.reset();
+    wasCockedAudioRef.current = false;
+    firedUntilRef.current = 0;
+    soundFX.playCombatSwitch();
+    setStatusBanner(`${COMBAT_MODES.find((c) => c.id === m)!.name} READY`);
+  }, []);
 
   const getStageSize = () => {
     const el = stageRef.current;
     if (!el) return { w: 950, h: 640 };
     return { w: el.clientWidth || 950, h: el.clientHeight || 640 };
+  };
+
+  // Hit testing uses the monsters' ACTUAL rendered sprite boxes (same coordinate space as the crosshair),
+  // so what you see under the crosshair is what takes the damage:
+  //   1. a sprite under (or within a small forgiving pad of) the aim point, nearest sprite centre first
+  //   2. otherwise a monster whose plate/label box contains the point
+  //   3. otherwise the nearest sprite within a webcam-friendly radius
+  const cardElsRef = useRef<Map<number, HTMLElement>>(new Map());
+  const hitTest = useCallback((x: number, y: number): FloatingTargetCard | null => {
+    const stage = stageRef.current;
+    if (!stage) return null;
+    const sr = stage.getBoundingClientRect();
+    const px = sr.left + x;
+    const py = sr.top + y;
+    let sprite: FloatingTargetCard | null = null;
+    let spriteD = Infinity;
+    let label: FloatingTargetCard | null = null;
+    let labelD = Infinity;
+    let near: FloatingTargetCard | null = null;
+    let nearEdge = Infinity;
+    for (const c of cardsRef.current) {
+      if (c.isDestroying || c.hidden) continue;
+      const el = cardElsRef.current.get(c.tab.id);
+      const spr = el?.querySelector('.monster-sprite-stage svg');
+      if (!el || !spr) continue;
+      const r = spr.getBoundingClientRect();
+      const d = Math.hypot(px - (r.left + r.width / 2), py - (r.top + r.height / 2));
+      const edge = Math.hypot(Math.max(r.left - px, 0, px - r.right), Math.max(r.top - py, 0, py - r.bottom));
+      if (edge <= HIT_PAD_PX) {
+        if (d < spriteD) {
+          spriteD = d;
+          sprite = c;
+        }
+        continue;
+      }
+      const er = el.getBoundingClientRect();
+      if (px >= er.left && px <= er.right && py >= er.top && py <= er.bottom && d < labelD) {
+        labelD = d;
+        label = c;
+      }
+      if (edge <= HIT_NEAR_PX && edge < nearEdge) {
+        nearEdge = edge;
+        near = c;
+      }
+    }
+    return sprite ?? label ?? near;
+  }, []);
+
+  // Lock history: the HUD shows which monster is locked; attacks use the lock from just before the
+  // trigger motion (thumb fold / palm open perturbs the fingertip), so a visible lock means damage.
+  const lockLogRef = useRef<Array<{ t: number; id: number | null }>>([]);
+  const noteLock = (id: number | null) => {
+    const log = lockLogRef.current;
+    log.push({ t: performance.now(), id });
+    if (log.length > 60) log.shift();
+  };
+  const lockAt = (t: number): number | null => {
+    let id: number | null = null;
+    for (const e of lockLogRef.current) if (e.t <= t) id = e.id;
+    return id;
+  };
+  const liveTarget = (id: number | null) => (id === null ? null : cardsRef.current.find((c) => c.tab.id === id && !c.isDestroying && !c.hidden) ?? null);
+  /** Target for a gesture attack: the lock ~140ms ago, else the lock right now. */
+  const resolveGestureTarget = (): number | null => {
+    const now = performance.now();
+    const before = liveTarget(lockAt(now - 140));
+    const current = liveTarget(lockedTabIdRef.current);
+    return (before ?? current)?.tab.id ?? null;
+  };
+
+  // development diagnostics (?debug): one record per attack, never per frame
+  const attackCountRef = useRef(0);
+  const [diag, setDiag] = useState<Record<string, string | number>>({});
+  const diagRef = useRef<Record<string, string | number>>({});
+  const recordAttack = (rec: Record<string, string | number>) => {
+    diagRef.current = { ...diagRef.current, ...rec };
+    if (DEBUG_HITBOX) console.info('[TW attack]', rec);
   };
 
   // Direct DOM crosshair transform update — zero React re-render latency
@@ -149,22 +330,49 @@ export const Arena: React.FC = () => {
       crosshairDomRef.current.style.transform = `translate3d(${stageX}px, ${stageY}px, 0)`;
     }
 
-    const { w: stageW, h: stageH } = getStageSize();
-    const hit = findTargetAtPoint(cardsRef.current, stageX, stageY, stageW, stageH, 30);
+    const hit = hitTest(stageX, stageY);
     const nextLockedId = hit ? hit.tab.id : null;
     if (nextLockedId !== lockedTabIdRef.current) {
       lockedTabIdRef.current = nextLockedId;
+      noteLock(nextLockedId);
       setLockedTabId(nextLockedId);
     }
-  }, []);
+  }, [hitTest]);
 
   // Load real or fallback tabs
   const loadTabs = useCallback(async () => {
-    const { tabs, usingRealTabs: isReal } = await queryRaidTargets();
+    const { tabs, groups: g, usingRealTabs: isReal } = await queryRaidTargets();
     defeatedIdsSetRef.current.clear();
     setUsingRealTabs(isReal);
-    setCards(createFloatingCards(tabs));
+    setGroups(g);
+    groupsRef.current = g;
+    setCards(mergeCards([], tabs, g, collapsedRef.current));
   }, []);
+
+  // Keep the arena in sync with tabs/groups changed in the browser while the game runs
+  const syncTabs = useCallback(async () => {
+    if (!isChromeExtensionEnv()) return;
+    const q = await queryRaidTargets();
+    if (!q.usingRealTabs) return; // never swap real monsters for simulated ones mid-game
+    setUsingRealTabs(true);
+    setGroups(q.groups);
+    groupsRef.current = q.groups;
+    setCards((prev) => mergeCards(prev, q.tabs, q.groups, collapsedRef.current));
+  }, []);
+  const syncTabsRef = useRef(syncTabs);
+  syncTabsRef.current = syncTabs;
+  useEffect(() => subscribeTabChanges(() => syncTabsRef.current()), []);
+
+  const toggleSquad = useCallback((groupId: number) => {
+    const set = collapsedRef.current;
+    if (set.has(groupId)) set.delete(groupId);
+    else set.add(groupId);
+    setCards((prev) => prev.map((c) => (!c.squad && c.tab.groupId === groupId ? { ...c, hidden: set.has(groupId) } : c)));
+  }, []);
+
+  // A legion boss only lives while at least one member does
+  const pruneLegions = (cs: FloatingTargetCard[]) =>
+    cs.filter((c) => !c.squad || cs.some((m) => !m.squad && !m.isDestroying && m.tab.groupId === c.squad!.groupId));
 
   useEffect(() => {
     loadTabs();
@@ -180,7 +388,7 @@ export const Arena: React.FC = () => {
 
   const handleRefreshTargets = async () => {
     await loadTabs();
-    setStatusBanner('RESCANNED BROWSER TABS // MONSTERS MATERIALIZED');
+    setStatusBanner('RESCANNED BROWSER TABS · WRAITHS SUMMONED');
   };
 
   // Purchase or Equip Weapon in Armory
@@ -195,7 +403,7 @@ export const Arena: React.FC = () => {
 
     if (credits < spec.cost) {
       soundFX.playMiss();
-      setStatusBanner(`INSUFFICIENT CREDITS FOR ${spec.name.toUpperCase()} (NEED ${spec.cost} CR)`);
+      setStatusBanner(`THE BLACKSMITH TURNS YOU AWAY: NOT ENOUGH CREDITS FOR ${spec.name.toUpperCase()} (NEED ${spec.cost} CR)`);
       return;
     }
 
@@ -204,13 +412,15 @@ export const Arena: React.FC = () => {
     setEquippedWeaponId(weaponId);
     soundFX.playWeaponUpgrade();
     setStatusBanner(
-      `UNLOCKED & EQUIPPED ${spec.name.toUpperCase()} (-${spec.cost} CR // ${spec.damage} DMG)`
+      `FORGED & EQUIPPED ${spec.name.toUpperCase()} (-${spec.cost} CR · ${spec.damage} DMG)`
     );
   };
 
   // Core Shooting Mechanic with Weapon Damage (1 / 2 / 3 HP) & Final-Hit Closure
   const fireShot = useCallback(
-    async (aimStageX: number, aimStageY: number, source: 'hand' | 'mouse' | 'keyboard') => {
+    async (aimStageX: number, aimStageY: number, source: 'hand' | 'mouse' | 'keyboard', opts?: ShotOpts) => {
+      const style = opts?.style ?? 'bolt';
+      const beamFrom = opts?.pathFrom ?? { x: 0, y: 0 };
       const { w: stageW, h: stageH } = getStageSize();
       const originX = stageW * 0.5;
       const originY = stageH - 12;
@@ -220,22 +430,40 @@ export const Arena: React.FC = () => {
       setCrosshairRecoil(true);
       setTimeout(() => setCrosshairRecoil(false), 110);
 
-      const hitCard = findTargetAtPoint(cardsRef.current, aimStageX, aimStageY, stageW, stageH, 30);
+      const hitCard =
+        opts?.tabId !== undefined
+          ? cardsRef.current.find((c) => c.tab.id === opts.tabId && !c.isDestroying) ?? null
+          : hitTest(aimStageX, aimStageY);
+      if (!opts?.pathFrom) {
+        beamFrom.x = originX;
+        beamFrom.y = originY;
+      }
+      const bladeEnd = style === 'blade' ? opts?.pathTo : undefined;
+      const attackN = ++attackCountRef.current;
+      const base = { n: attackN, source, style, aim: `${Math.round(aimStageX)},${Math.round(aimStageY)}`, target: hitCard?.tab.id ?? 'none', hpBefore: hitCard?.hp ?? '-', hpAfter: '-', dmg: weapon.damage };
       const beamId = `beam-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-      soundFX.playLaser(weapon.level);
+      if (style === 'snap') soundFX.playSnapRelease();
+      else if (style === 'blade') soundFX.playSwordSwing();
+      else soundFX.playLaser(weapon.level);
 
       if (!hitCard || defeatedIdsSetRef.current.has(hitCard.tab.id)) {
+        recordAttack({ ...base, result: 'REJECTED', reason: hitCard ? 'target already defeated' : 'no monster under crosshair' });
         soundFX.playMiss();
         setCombo(1);
+        setBursts((prev) => [
+          ...prev.slice(-8),
+          { id: `miss-${Date.now()}`, x: aimStageX, y: aimStageY, particles: [], label: 'MISS', createdAt: Date.now() },
+        ]);
         setLasers((prev) => [
           ...prev.slice(-6),
           {
             id: beamId,
-            fromX: originX,
-            fromY: originY,
-            toX: aimStageX,
-            toY: aimStageY,
+            fromX: beamFrom.x,
+            fromY: beamFrom.y,
+            toX: bladeEnd ? bladeEnd.x : aimStageX,
+            toY: bladeEnd ? bladeEnd.y : aimStageY,
+            style,
             hit: false,
             color: weapon.laserColor,
             coreColor: weapon.coreColor,
@@ -250,16 +478,18 @@ export const Arena: React.FC = () => {
       const targetCenterY = (hitCard.y / 100) * stageH;
       const dmg = weapon.damage;
       const nextHp = Math.max(0, hitCard.hp - dmg);
+      recordAttack({ ...base, result: 'ACCEPTED', reason: nextHp === 0 ? 'final blow' : 'damage', hpAfter: nextHp });
       const isBoss = hitCard.archetype.tier === 5;
 
       setLasers((prev) => [
         ...prev.slice(-6),
         {
           id: beamId,
-          fromX: originX,
-          fromY: originY,
-          toX: targetCenterX,
-          toY: targetCenterY,
+          fromX: beamFrom.x,
+          fromY: beamFrom.y,
+          toX: bladeEnd ? bladeEnd.x : targetCenterX,
+          toY: bladeEnd ? bladeEnd.y : targetCenterY,
+          style,
           hit: true,
           color: weapon.laserColor,
           coreColor: weapon.coreColor,
@@ -268,15 +498,27 @@ export const Arena: React.FC = () => {
         },
       ]);
 
+      // Legion bosses are visual only: a shot toggles expand/collapse, never damages or closes a tab
+      if (hitCard.squad) {
+        recordAttack({ ...base, result: 'REJECTED', reason: 'legion boss only toggles' });
+        toggleSquad(hitCard.squad.groupId);
+        soundFX.playGunReady();
+        return;
+      }
+
       // Non-lethal hit: damage flash, recoil, HP reduction, NO tab closure
       if (nextHp > 0) {
-        if (isBoss || dmg >= 2) {
+        if (style === 'blade') {
+          soundFX.playSwordImpact();
+        } else if (isBoss || dmg >= 2) {
           soundFX.playBossDamage();
         } else {
           soundFX.playMonsterHit();
         }
 
         const now = Date.now();
+        // update the ref immediately: a second attack in the same frame must see this damage
+        cardsRef.current = cardsRef.current.map((c) => (c.tab.id === hitCard.tab.id ? { ...c, hp: nextHp } : c));
         setCards((prev) =>
           prev.map((c) =>
             c.tab.id === hitCard.tab.id
@@ -315,12 +557,14 @@ export const Arena: React.FC = () => {
       defeatedIdsSetRef.current.add(hitCard.tab.id);
 
       soundFX.playMonsterDeath(isBoss);
+      if (style !== 'bolt') soundFX.playFinisher();
 
       const currentCombo = comboRef.current;
       if (currentCombo > 1) {
         soundFX.playCombo(currentCombo);
       }
 
+      cardsRef.current = cardsRef.current.map((c) => (c.tab.id === hitCard.tab.id ? { ...c, hp: 0, isDestroying: true } : c));
       setCards((prev) =>
         prev.map((c) =>
           c.tab.id === hitCard.tab.id
@@ -355,7 +599,7 @@ export const Arena: React.FC = () => {
           targetCenterX,
           targetCenterY,
           hitCard.archetype.tier,
-          `+${scoreEarned} PTS // +${baseCreditsEarned} CR`,
+          `+${scoreEarned} PTS · +${baseCreditsEarned} CR`,
           liveModeRef.current && !hitCard.tab.isMock ? 'ARCHIVED & CLOSED' : 'DEFEATED (SAFE)',
           true
         ),
@@ -380,17 +624,17 @@ export const Arena: React.FC = () => {
       );
 
       const remainingAfter = cardsRef.current.filter(
-        (c) => c.tab.id !== hitCard.tab.id && !c.isDestroying
+        (c) => c.tab.id !== hitCard.tab.id && !c.isDestroying && !c.squad
       ).length;
       if (remainingAfter === 0) {
         setTimeout(() => soundFX.playVictory(), 180);
       }
 
       setTimeout(() => {
-        setCards((prev) => prev.filter((c) => c.tab.id !== hitCard.tab.id));
+        setCards((prev) => pruneLegions(prev.filter((c) => c.tab.id !== hitCard.tab.id)));
       }, 210);
     },
-    []
+    [toggleSquad, hitTest]
   );
 
   fireShotRef.current = fireShot;
@@ -405,10 +649,14 @@ export const Arena: React.FC = () => {
     const restoredTab: RaidTab = await restoreClosedTab(latest, liveMode);
     defeatedIdsSetRef.current.delete(restoredTab.id);
 
-    setCards((prev) => {
-      const restoredCards = createFloatingCards([restoredTab]);
-      return [...prev, ...restoredCards];
-    });
+    setCards((prev) =>
+      mergeCards(
+        prev,
+        [...prev.filter((c) => !c.squad && !c.isDestroying).map((c) => c.tab), restoredTab],
+        groupsRef.current,
+        collapsedRef.current
+      )
+    );
     setArchivedCount((prev) => Math.max(0, prev - 1));
     setDefeatedCount((prev) => Math.max(0, prev - 1));
     setStatusBanner(`UNDO: "${restoredTab.title.slice(0, 44)}" RESTORED AT FULL HP`);
@@ -427,31 +675,56 @@ export const Arena: React.FC = () => {
 
       setCards((prev) => {
         if (prev.length === 0) return prev;
-        const next = stepFloatingCards(prev, dt, elapsed);
+        const { w: sw, h: sh } = getStageSize();
+        const next = stepFloatingCards(prev, dt, elapsed, sw, sh);
         cardsRef.current = next;
         return next;
       });
 
       // Keep lock indicator synced as monsters drift under stationary crosshair
       const { w: stageW, h: stageH } = getStageSize();
-      const hit = findTargetAtPoint(
-        cardsRef.current,
-        crosshairRef.current.x,
-        crosshairRef.current.y,
-        stageW,
-        stageH,
-        30
-      );
+      const hit = hitTest(crosshairRef.current.x, crosshairRef.current.y);
       const nextLockedId = hit ? hit.tab.id : null;
       if (nextLockedId !== lockedTabIdRef.current) {
         lockedTabIdRef.current = nextLockedId;
+        noteLock(nextLockedId);
         setLockedTabId(nextLockedId);
+      }
+
+      if (DEBUG_HITBOX && Math.round(now / 16) % 6 === 0 && stageRef.current) {
+        const sr = stageRef.current.getBoundingClientRect();
+        const out: typeof debugRects = [];
+        cardElsRef.current.forEach((el, id) => {
+          const spr = el.querySelector('.monster-sprite-stage svg');
+          if (!spr) return;
+          const r = spr.getBoundingClientRect();
+          const e = el.getBoundingClientRect();
+          out.push({ id, sx: r.left - sr.left, sy: r.top - sr.top, sw: r.width, sh: r.height, ex: e.left - sr.left, ey: e.top - sr.top, ew: e.width, eh: e.height });
+        });
+        setDebugRects(out);
+      }
+
+      if (DEBUG_HITBOX && Math.round(now / 16) % 8 === 0) {
+        const f = lastFrameRef.current;
+        const lockId = lockedTabIdRef.current;
+        const lc = lockId === null ? null : cardsRef.current.find((c) => c.tab.id === lockId);
+        setDiag({
+          ...diagRef.current,
+          hand: f?.handDetected ? 'YES' : 'NO',
+          gesture: !f || !f.handDetected ? 'IDLE' : f.statusLabel === 'FIRED' ? 'FIRED' : READY_LABELS.has(f.statusLabel) ? 'READY' : 'IDLE',
+          cocked: f?.thumbCocked ? 'yes' : 'no',
+          attacks: attackCountRef.current,
+          crosshair: `${Math.round(crosshairRef.current.x)},${Math.round(crosshairRef.current.y)}`,
+          lock: lockId ?? 'none',
+          lockHp: lc ? `${lc.hp}/${lc.maxHp}` : '-',
+          thumb: f?.thumbClearance !== undefined ? `clr ${f.thumbClearance.toFixed(2)} ext ${(f.thumbExtension ?? 0).toFixed(2)}  cocks ${gestureEngineRef.current.stats.cocks} fires ${gestureEngineRef.current.stats.fires} foldNoCock ${gestureEngineRef.current.stats.foldsWithoutCock} drops ${gestureEngineRef.current.stats.poseDrops}` : '-',
+        });
       }
 
       const wallNow = Date.now();
       setLasers((prev) =>
-        prev.some((l) => wallNow - l.createdAt > 210)
-          ? prev.filter((l) => wallNow - l.createdAt <= 210)
+        prev.some((l) => wallNow - l.createdAt > beamTtl(l))
+          ? prev.filter((l) => wallNow - l.createdAt <= beamTtl(l))
           : prev
       );
       setBursts((prev) =>
@@ -492,7 +765,7 @@ export const Arena: React.FC = () => {
       thumbCocked: false,
       thumbFiredThisFrame: false,
       statusLabel: 'NO HAND',
-      detailHint: 'CAMERA STANDBY // MOUSE & [SPACE] ACTIVE',
+      detailHint: 'CAMERA STANDBY · MOUSE & [SPACE] ACTIVE',
     }));
     setPerfMetrics((prev) => ({
       ...prev,
@@ -502,6 +775,162 @@ export const Arena: React.FC = () => {
       gestureState: 'NO HAND',
     }));
     setStatusBanner('CAMERA DISABLED — MOUSE & [SPACE] CONTROLS ACTIVE');
+  }, []);
+
+  // One landmark frame -> gesture state, crosshair and attacks. Used by the camera loop (and by the
+  // ?debug synthetic-landmark test hook), so tests exercise the real combat path.
+  const lastFrameRef = useRef<GestureFrameResult | null>(null);
+  const lastStatusRef = useRef<string>('');
+  const lastCockedRef = useRef<boolean>(false);
+  const handleHandFrame = (
+    firstHand: Parameters<GestureEngine['processLandmarks']>[0],
+    inferStart: number
+  ) => {
+    const canvas = landmarkCanvasRef.current;
+      const mode = combatModeRef.current;
+      let frameResult: GestureFrameResult;
+
+      if (mode === 'hexcaster') {
+        frameResult = gestureEngineRef.current.processLandmarks(firstHand, inferStart);
+        if (frameResult.isFingerGunPose && frameResult.thumbCocked && !wasCockedAudioRef.current) {
+          soundFX.playGunReady();
+        }
+        wasCockedAudioRef.current = frameResult.isFingerGunPose && frameResult.thumbCocked;
+      } else {
+        // One shared landmark stream; only the selected style interprets it
+        const burst = mode === 'soulsnap' ? burstRef.current.process(firstHand, inferStart) : null;
+        const sword = mode === 'wraithblade' ? swordRef.current.process(firstHand, inferStart) : null;
+        const aim = burst?.aim ?? sword?.aim ?? null;
+        const pose = burst?.pose ?? sword?.pose ?? 'none';
+        const fired = Boolean(burst?.cast || sword?.slash);
+        if (fired) firedUntilRef.current = inferStart + 220;
+        if (burst?.armed && !wasCockedAudioRef.current) soundFX.playSnapArm();
+        wasCockedAudioRef.current = Boolean(burst?.armed);
+        const swordReady = mode === 'wraithblade' && pose === 'sword';
+        frameResult = {
+          handDetected: Boolean(aim),
+          isFingerGunPose: false,
+          thumbCocked: Boolean(burst?.armed),
+          thumbFiredThisFrame: fired,
+          cooldownProgress: 0,
+          crosshairX: aim?.x ?? 0.5,
+          crosshairY: aim?.y ?? 0.5,
+          statusLabel: !aim
+            ? 'NO HAND'
+            : inferStart < firedUntilRef.current
+            ? 'FIRED'
+            : burst?.armed
+            ? 'SPELL ARMED'
+            : swordReady
+            ? 'SWORD READY'
+            : mode === 'soulsnap' && pose === 'fist'
+            ? 'FIST DETECTED'
+            : 'POSE NOT RECOGNIZED',
+          detailHint: !aim
+            ? 'RAISE HAND IN VIEW OF CAMERA'
+            : mode === 'soulsnap'
+            ? burst?.armed
+              ? 'SPELL ARMED: OPEN YOUR PALM TO CAST'
+              : 'MAKE A FIST TO ARM THE SPELL'
+            : swordReady
+            ? 'HOLD STEADY: THE BLADE FALLS ON YOUR TARGET'
+            : 'RAISE INDEX + MIDDLE FINGERS, FOLD THE OTHERS',
+          poseConfidence: aim ? 0.8 : 0,
+        };
+
+        // Both casts hit whatever the crosshair currently targets (one target, one action)
+        if (fired && !raidStartedRef.current) {
+          setStatusBanner('PRESS START HUNT TO ATTACK');
+          recordAttack({ n: ++attackCountRef.current, source: 'hand', style: burst?.cast ? 'snap' : 'blade', result: 'REJECTED', reason: 'hunt not started' });
+        }
+        if (raidStartedRef.current && aim) {
+          const { w: stageW, h: stageH } = getStageSize();
+          if (burst?.cast) {
+            fireShotRef.current(burst.cast.x * stageW, burst.cast.y * stageH, 'hand', { style: 'snap', tabId: resolveGestureTarget() ?? undefined });
+          } else if (sword?.slash) {
+            const sx = sword.slash.x * stageW;
+            const sy = sword.slash.y * stageH;
+            const target = liveTarget(resolveGestureTarget()) ?? hitTest(sx, sy);
+            const cx = target ? (target.x / 100) * stageW : sx;
+            const cy = target ? (target.y / 100) * stageH : sy;
+            fireShotRef.current(sx, sy, 'hand', {
+              style: 'blade',
+              tabId: target?.tab.id,
+              pathFrom: { x: cx - 95, y: cy - 75 },
+              pathTo: { x: cx + 95, y: cy + 75 },
+            });
+          }
+        }
+      }
+
+      lastFrameRef.current = frameResult;
+      if (canvas) {
+        drawHandLandmarks(
+          canvas,
+          firstHand,
+          frameResult.isFingerGunPose || READY_LABELS.has(frameResult.statusLabel),
+          frameResult.thumbCocked
+        );
+      }
+
+      // Direct DOM crosshair update on every tracked frame (0 React re-render overhead)
+      if (frameResult.handDetected) {
+        const { w: stageW, h: stageH } = getStageSize();
+        const nextX = frameResult.crosshairX * stageW;
+        const nextY = frameResult.crosshairY * stageH;
+
+        if (controlSourceRef.current !== 'hand') {
+          controlSourceRef.current = 'hand';
+          setControlSource('hand');
+        }
+
+        updateCrosshairPosition(nextX, nextY);
+
+        if (mode === 'hexcaster' && frameResult.thumbFiredThisFrame) {
+          if (!raidStartedRef.current) {
+            setStatusBanner('PRESS START HUNT TO ATTACK');
+            recordAttack({ n: ++attackCountRef.current, source: 'hand', style: 'bolt', result: 'REJECTED', reason: 'hunt not started' });
+          } else {
+            // __noLatch (debug only) reproduces the old behaviour: shoot at the current, already nudged, crosshair
+            const latch = !(DEBUG_HITBOX && (window as unknown as { __noLatch?: boolean }).__noLatch);
+            fireShotRef.current(
+              (latch ? frameResult.fireAimX ?? frameResult.crosshairX : frameResult.crosshairX) * getStageSize().w,
+              (latch ? frameResult.fireAimY ?? frameResult.crosshairY : frameResult.crosshairY) * getStageSize().h,
+              'hand',
+              { tabId: latch ? resolveGestureTarget() ?? undefined : undefined }
+            );
+          }
+        }
+      }
+
+      // Only commit React state when gesture status label or cocked state changes
+      if (
+        frameResult.statusLabel !== lastStatusRef.current ||
+        frameResult.thumbCocked !== lastCockedRef.current ||
+        frameResult.thumbFiredThisFrame
+      ) {
+        if (DEBUG_HITBOX) console.info('[TW gesture]', mode, frameResult.statusLabel, frameResult.thumbCocked ? 'cocked' : 'not cocked', frameResult.thumbFiredThisFrame ? 'FIRE' : '');
+        lastStatusRef.current = frameResult.statusLabel;
+        lastCockedRef.current = frameResult.thumbCocked;
+        setGestureState(frameResult);
+      }
+  };
+  const handleHandFrameRef = useRef(handleHandFrame);
+  handleHandFrameRef.current = handleHandFrame;
+  useEffect(() => {
+    if (DEBUG_HITBOX) {
+      (window as unknown as Record<string, unknown>).__tabwraithTest = {
+        feed: (lm: Parameters<GestureEngine['processLandmarks']>[0], t: number) => handleHandFrameRef.current(lm, t),
+        setRaidStarted: () => setRaidStarted(true),
+        grantCredits: (n: number) => setCredits((c) => c + n),
+        lastAttack: () => diagRef.current,
+        hitMs: (n: number) => {
+          const t0 = performance.now();
+          for (let i = 0; i < n; i++) hitTest(300 + (i % 50), 300);
+          return (performance.now() - t0) / n;
+        },
+      };
+    }
   }, []);
 
   // Enable Webcam + Optimized Zero-Overlap MediaPipe Pipeline
@@ -547,7 +976,7 @@ export const Arena: React.FC = () => {
       setCameraStatus('active');
       controlSourceRef.current = 'hand';
       setControlSource('hand');
-      setStatusBanner('CAMERA ONLINE // AIM WITH INDEX FINGER, FOLD THUMB TO SHOOT');
+      setStatusBanner('CAMERA ONLINE · AIM WITH INDEX FINGER, FOLD THUMB TO SHOOT');
 
       let lastMediaTime = -1;
       let lastInferenceTimestamp = -1;
@@ -555,8 +984,8 @@ export const Arena: React.FC = () => {
       let trackFramesCount = 0;
       let latestInferMs = 0;
       let lastPerfCommitTime = performance.now();
-      let lastGestureStatusCommitted = '';
-      let lastCockedCommitted = false;
+      lastStatusRef.current = '';
+      lastCockedRef.current = false;
 
       const processVideoFrame = (nowMs: number, mediaTime?: number) => {
         if (!trackingActiveRef.current) return;
@@ -587,59 +1016,7 @@ export const Arena: React.FC = () => {
               latestInferMs = performance.now() - inferStart;
               trackFramesCount++;
 
-              const firstHand = detections.landmarks?.[0] ?? null;
-              const frameResult = gestureEngineRef.current.processLandmarks(
-                firstHand,
-                inferStart
-              );
-
-              if (
-                frameResult.isFingerGunPose &&
-                frameResult.thumbCocked &&
-                !wasCockedAudioRef.current
-              ) {
-                soundFX.playGunReady();
-              }
-              wasCockedAudioRef.current =
-                frameResult.isFingerGunPose && frameResult.thumbCocked;
-
-              if (canvas) {
-                drawHandLandmarks(
-                  canvas,
-                  firstHand,
-                  frameResult.isFingerGunPose,
-                  frameResult.thumbCocked
-                );
-              }
-
-              // Direct DOM crosshair update on every tracked frame (0 React re-render overhead)
-              if (frameResult.handDetected) {
-                const { w: stageW, h: stageH } = getStageSize();
-                const nextX = frameResult.crosshairX * stageW;
-                const nextY = frameResult.crosshairY * stageH;
-
-                if (controlSourceRef.current !== 'hand') {
-                  controlSourceRef.current = 'hand';
-                  setControlSource('hand');
-                }
-
-                updateCrosshairPosition(nextX, nextY);
-
-                if (frameResult.thumbFiredThisFrame && raidStartedRef.current) {
-                  fireShotRef.current(nextX, nextY, 'hand');
-                }
-              }
-
-              // Only commit React state when gesture status label or cocked state changes
-              if (
-                frameResult.statusLabel !== lastGestureStatusCommitted ||
-                frameResult.thumbCocked !== lastCockedCommitted ||
-                frameResult.thumbFiredThisFrame
-              ) {
-                lastGestureStatusCommitted = frameResult.statusLabel;
-                lastCockedCommitted = frameResult.thumbCocked;
-                setGestureState(frameResult);
-              }
+              handleHandFrameRef.current(detections.landmarks?.[0] ?? null, inferStart);
             } finally {
               inferenceBusyRef.current = false;
             }
@@ -655,12 +1032,16 @@ export const Arena: React.FC = () => {
           trackFramesCount = 0;
           lastPerfCommitTime = nowMs;
 
+          faceCtlRef.current.report(camFps, trackFps);
+          setFaceSeen(faceCtlRef.current.visible);
+          setFaceStats(faceCtlRef.current.stats());
+
           setPerfMetrics({
             cameraFps: camFps,
             trackingFps: trackFps,
             inferenceMs: Math.round(latestInferMs * 10) / 10,
             delegate: getActiveDelegate(),
-            gestureState: lastGestureStatusCommitted || 'NO HAND',
+            gestureState: lastStatusRef.current || 'NO HAND',
           });
         }
 
@@ -709,9 +1090,29 @@ export const Arena: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    const ctl = faceCtlRef.current;
+    ctl.onAutoDisable = () => {
+      setRelic('off');
+      setStatusBanner('RELIC TRACKING PAUSED TO KEEP HAND TRACKING FAST');
+    };
+    if (cameraStatus === 'active' && relic !== 'off' && videoRef.current && maskCanvasRef.current) {
+      ctl.start(videoRef.current, maskCanvasRef.current, relic);
+    } else {
+      ctl.stop();
+      setFaceSeen(false);
+      setFaceStats(null);
+    }
+  }, [cameraStatus, relic]);
+  useEffect(() => () => faceCtlRef.current.stop(), []);
+
   // Spacebar fallback shooting
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
+        selectCombatMode((['hexcaster', 'soulsnap', 'wraithblade'] as const)[+e.code.slice(5) - 1]);
+        return;
+      }
       if (e.code === 'Space' && raidStartedRef.current) {
         if (
           document.activeElement instanceof HTMLElement &&
@@ -725,10 +1126,11 @@ export const Arena: React.FC = () => {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [selectCombatMode]);
 
   // Stage mouse aiming & click fallback (direct DOM crosshair update)
   const handleStageMouseMove = (e: React.MouseEvent<HTMLElement>) => {
+    if (e.movementX === 0 && e.movementY === 0) return; // synthetic move from animated monsters under a still cursor
     const rect = e.currentTarget.getBoundingClientRect();
     const localX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
     const localY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
@@ -774,9 +1176,117 @@ export const Arena: React.FC = () => {
     setMuted(!muted);
   };
 
+  const memberTabs = (groupId: number): RaidTab[] =>
+    cards
+      .filter((c) => !c.squad && !c.isDestroying && c.tab.groupId === groupId)
+      .map((c) => c.tab)
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  const legions: LegionInfo[] = groups
+    .map((g) => ({ group: g, members: memberTabs(g.id), collapsedInArena: collapsedRef.current.has(g.id) }))
+    .filter((l) => l.members.length > 0);
+  const ungroupedCount = cards.filter((c) => !c.squad && !c.isDestroying && c.tab.groupId === undefined).length;
+
+  const openLegions = async () => {
+    setArmoryOpen(false);
+    setThreatInfoOpen(false);
+    setLegionsOpen((o) => !o);
+    setSessions(await listVault());
+  };
+
+  const saveLegion = async (l: LegionInfo) => {
+    const res = await saveGroupSession(l.group, l.members);
+    setSessions(await listVault());
+    setStatusBanner(res.success ? `SAVED "${l.group.title}" TO THE SOUL ARCHIVE (${l.members.length} TABS)` : `SAVE FAILED: ${res.error}`);
+  };
+
+  const restoreLegion = async (session: VaultSession) => {
+    if (legionBusyRef.current) return;
+    legionBusyRef.current = true;
+    setLegionBusy(true);
+    try {
+      const res = await restoreSession(session, liveModeRef.current);
+      if (!liveModeRef.current) {
+        setStatusBanner('SAFE MODE: RESTORE SIMULATED. ARM LIVE MODE TO REOPEN TABS');
+      } else {
+        setStatusBanner(
+          res.success
+            ? `RESTORED ${res.count} TABS${res.grouped ? ' AS A NATIVE GROUP' : ' (GROUP COULD NOT BE RECREATED)'}${res.error ? ` · ${res.error}` : ''}`
+            : `RESTORE FAILED: ${res.error}`
+        );
+        window.setTimeout(() => syncTabsRef.current(), 600);
+      }
+    } finally {
+      legionBusyRef.current = false;
+      setLegionBusy(false);
+    }
+  };
+
+  const toggleNativeGroup = async (l: LegionInfo) => {
+    const ok = await setNativeGroupCollapsed(l.group.id, !l.group.collapsed);
+    if (ok) syncTabsRef.current();
+    else setStatusBanner('COULD NOT FOLD THE NATIVE GROUP');
+  };
+
+  // Group cleanup: LIVE MODE only, snapshot first, bookmark everything first, single request per tab
+  const cleanupLegion = async (l: LegionInfo) => {
+    if (!liveModeRef.current) {
+      setStatusBanner('SAFE MODE: CLEANUP BLOCKED. ARM LIVE MODE FIRST');
+      return;
+    }
+    if (legionBusyRef.current) return;
+    const tabs = l.members.filter((t) => !t.isMock && !defeatedIdsSetRef.current.has(t.id));
+    if (tabs.length === 0) {
+      setStatusBanner('NOTHING ELIGIBLE TO CLOSE (SIMULATED TABS ARE NEVER CLOSED)');
+      return;
+    }
+    legionBusyRef.current = true;
+    setLegionBusy(true);
+    const ids = new Set(tabs.map((t) => t.id));
+    try {
+      const saved = await saveGroupSession(l.group, tabs);
+      if (!saved.success) {
+        setStatusBanner(`CLEANUP ABORTED: ARCHIVE FAILED (${saved.error})`);
+        return;
+      }
+      setSessions(await listVault());
+      ids.forEach((id) => defeatedIdsSetRef.current.add(id));
+      setCards((prev) => prev.map((c) => (ids.has(c.tab.id) ? { ...c, isDestroying: true } : c)));
+      const res = await archiveAndCloseMany(tabs, true);
+      if (!res.success) {
+        ids.forEach((id) => defeatedIdsSetRef.current.delete(id));
+        setCards((prev) => prev.map((c) => (ids.has(c.tab.id) ? { ...c, isDestroying: false } : c)));
+        setStatusBanner(`CLEANUP ABORTED, NO TABS CLOSED: ${res.error}`);
+        return;
+      }
+      soundFX.playRestore();
+      setClosedHistory((prev) => [...res.records, ...prev]);
+      setArchivedCount((n) => n + res.records.length);
+      setStatusBanner(`"${l.group.title}" ARCHIVED & CLOSED (${res.records.length} TABS). UNDO RESTORES ONE AT A TIME`);
+      window.setTimeout(() => setCards((prev) => pruneLegions(prev.filter((c) => !ids.has(c.tab.id)))), 210);
+    } finally {
+      legionBusyRef.current = false;
+      setLegionBusy(false);
+    }
+  };
+
   const equippedWeapon = WEAPON_BY_ID[equippedWeaponId];
+  const maxMonstersRef = useRef(0);
+  maxMonstersRef.current = Math.max(maxMonstersRef.current, cards.filter((c) => !c.isDestroying && !c.squad).length);
+  const maxMonsters = maxMonstersRef.current;
+  const mirrorState =
+    cameraStatus === 'denied' || cameraStatus === 'error'
+      ? 'mirror-error'
+      : cameraStatus !== 'active'
+      ? 'mirror-off'
+      : gestureState.statusLabel === 'FIRED'
+      ? 'mirror-fired'
+      : READY_LABELS.has(gestureState.statusLabel)
+      ? 'mirror-ready'
+      : gestureState.handDetected
+      ? 'mirror-tracking'
+      : 'mirror-idle';
   const lockedCard = cards.find((c) => !c.isDestroying && c.tab.id === lockedTabId) || null;
-  const activeCardsCount = cards.filter((c) => !c.isDestroying).length;
+  const activeCardsCount = cards.filter((c) => !c.isDestroying && !c.squad).length;
   const nowWall = Date.now();
 
   return (
@@ -792,64 +1302,77 @@ export const Arena: React.FC = () => {
       {/* TOP RETRO ARCADE HUD */}
       <header className="hud-topbar" data-hud-interactive="true">
         <div className="hud-brand">
-          <PixelBrandLogo size={36} />
-          <div>
-            <div className="hud-title-row">
-              <h1 className="hud-title">TAB RAID</h1>
-              <span className="hud-title-sub">MONSTER INVASION</span>
-            </div>
-            <p className="hud-status-line">{statusBanner}</p>
+          <PixelBrandLogo size={38} />
+          <div className="hud-wordmark">
+            <h1 className="hud-title">TABWRAITH</h1>
+            <span className="hud-title-sub">CURSE OF THE OPEN TABS</span>
           </div>
         </div>
 
-        <div className="hud-metrics" role="region" aria-label="Arcade Telemetry">
-          <div className="metric-box">
-            <span className="metric-label">MONSTERS</span>
-            <span className="metric-value" data-testid="remaining-count">
-              {activeCardsCount}
-            </span>
+        <span className="hud-divider" aria-hidden="true" />
+
+        <div className="hud-stats" role="region" aria-label="Hunt Status">
+          <div className="hud-stat hud-stat-hp" title="Cursed tabs remaining">
+            <span className="metric-label">CURSED TABS</span>
+            <div className="hud-hp">
+              <div className="hud-hp-bar">
+                <span style={{ width: `${Math.round((activeCardsCount / Math.max(1, maxMonsters)) * 100)}%` }} />
+              </div>
+              <span className="metric-value" data-testid="remaining-count">
+                {activeCardsCount}
+              </span>
+            </div>
           </div>
-          <div className="metric-box">
+          <div className="hud-stat">
             <span className="metric-label">SCORE</span>
             <span className="metric-value metric-lime" data-testid="score-value">
               {score.toString().padStart(6, '0')}
             </span>
           </div>
-          <div className="metric-box">
+          <div className="hud-stat">
             <span className="metric-label">CREDITS</span>
-            <span className="metric-value metric-amber" data-testid="credits-value">
+            <span className="metric-value metric-lime" data-testid="credits-value">
               {credits} CR
             </span>
           </div>
-          <div className="metric-box">
-            <span className="metric-label">COMBO</span>
+          <div className={`hud-combo ${combo > 1 ? 'hud-combo-hot' : ''}`} title="Combo multiplier">
             <span className="metric-value" data-testid="combo-value">
               {combo}x
             </span>
           </div>
-          <div className="metric-box">
-            <span className="metric-label">ARCHIVED</span>
-            <span className="metric-value metric-cyan" data-testid="archived-count">
-              {archivedCount}
-            </span>
-          </div>
+          <span className="hud-archived" title="Tabs archived this session">
+            ARCHIVED <b data-testid="archived-count">{archivedCount}</b>
+          </span>
         </div>
 
         <div className="hud-actions">
-          {/* ARMORY UPGRADE BUTTON */}
           <button
             type="button"
             className={`hud-btn hud-btn-armory ${armoryOpen ? 'armory-active' : ''}`}
             onClick={() => {
               setArmoryOpen((prev) => !prev);
               setThreatInfoOpen(false);
+              setLegionsOpen(false);
             }}
             data-testid="armory-toggle-btn"
-            title="Open Pixel Armory to upgrade weapon damage"
+            title="Visit The Blacksmith to forge stronger weapons"
           >
-            <PixelWeaponSprite weaponId={equippedWeaponId} size={24} />
-            <span>ARMORY ({equippedWeapon.damage}DMG)</span>
+            <PixelWeaponSprite weaponId={equippedWeaponId} size={22} />
+            <span>BLACKSMITH</span>
           </button>
+
+          <button
+            type="button"
+            className={`hud-btn ${legionsOpen ? 'armory-active' : ''}`}
+            onClick={openLegions}
+            data-testid="legions-toggle-btn"
+            title="Cursed Legions: tab groups and the Soul Archive"
+            aria-expanded={legionsOpen}
+          >
+            LEGIONS ({legions.length})
+          </button>
+
+          <span className="hud-divider" aria-hidden="true" />
 
           <button
             type="button"
@@ -883,6 +1406,8 @@ export const Arena: React.FC = () => {
             RESCAN
           </button>
 
+          <span className="hud-divider" aria-hidden="true" />
+
           <button
             type="button"
             className="hud-btn"
@@ -901,11 +1426,35 @@ export const Arena: React.FC = () => {
         <main
           ref={stageRef}
           className="arena-stage"
-          aria-label="Pixel Monster Arena"
+          aria-label="Cursed Battlefield"
           onMouseMove={handleStageMouseMove}
           onClick={handleStageClick}
         >
-          <div className="arena-scanlines" aria-hidden="true" />
+          <Battlefield />
+          <div className="arena-banner" key={statusBanner} role="status">{statusBanner}</div>
+
+          {legionsOpen && (
+            <LegionsPanel
+              legions={legions}
+              ungroupedCount={ungroupedCount}
+              sessions={sessions}
+              liveMode={liveMode}
+              busy={legionBusy}
+              native={isChromeExtensionEnv()}
+              onToggleArena={(id) => {
+                toggleSquad(id);
+              }}
+              onToggleNative={toggleNativeGroup}
+              onSave={saveLegion}
+              onCleanup={cleanupLegion}
+              onRestore={restoreLegion}
+              onDelete={async (id) => {
+                await deleteSession(id);
+                setSessions(await listVault());
+              }}
+              onClose={() => setLegionsOpen(false)}
+            />
+          )}
 
           {/* IN-GAME PIXEL ARMORY POPOVER PANEL */}
           {armoryOpen && (
@@ -916,7 +1465,7 @@ export const Arena: React.FC = () => {
             >
               <div className="armory-header">
                 <div>
-                  <span className="armory-title">PIXEL ARMORY // WEAPON UPGRADES</span>
+                  <span className="armory-title">THE BLACKSMITH · WEAPON FORGING</span>
                   <span className="armory-sub">
                     SPEND CREDITS WITHOUT REDUCING LIFETIME SCORE
                   </span>
@@ -1002,9 +1551,67 @@ export const Arena: React.FC = () => {
             const initialLetter = (card.tab.domain[0] || 'T').toUpperCase();
             const projectedRemainingHp = Math.max(0, card.hp - equippedWeapon.damage);
 
+            if (card.hidden) return null;
+
+            if (card.squad) {
+              const sq = card.squad;
+              const alive = cards.filter((c) => !c.squad && !c.isDestroying && c.tab.groupId === sq.groupId).length;
+              const folded = collapsedRef.current.has(sq.groupId);
+              return (
+                <div
+                  key={card.tab.id}
+                  ref={(el) => {
+                    if (el) cardElsRef.current.set(card.tab.id, el);
+                    else cardElsRef.current.delete(card.tab.id);
+                  }}
+                  data-testid={`legion-card-${sq.groupId}`}
+                  className={`monster-unit legion-unit ${isLocked ? 'monster-locked' : ''}`}
+                  style={{
+                    left: `${card.x}%`,
+                    top: `${card.y}%`,
+                    width: `${card.widthPx}px`,
+                    transform: `translate(-50%, -50%)`,
+                    ['--legion-color' as string]: legionColor(sq.color),
+                  }}
+                >
+                  <div className="legion-plate">
+                    <span className="legion-plate-title">{sq.title}</span>
+                    <span className="legion-plate-count">{alive} / {sq.total} TABS</span>
+                    <div className="legion-health" aria-label="Legion strength">
+                      <span style={{ width: `${Math.round((alive / Math.max(1, sq.total)) * 100)}%` }} />
+                    </div>
+                  </div>
+                  <div className="monster-sprite-stage">
+                    {isLocked && (
+                      <div className="target-reticle-brackets">
+                        <span className="lock-dmg-callout">{folded ? 'SHOOT TO EXPAND' : 'SHOOT TO COLLAPSE'}</span>
+                      </div>
+                    )}
+                    <LegionCrest color={sq.color} size={96} flash={isHitFlashing} />
+                  </div>
+                  <button
+                    type="button"
+                    className="hud-btn legion-toggle"
+                    data-hud-interactive="true"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSquad(sq.groupId);
+                    }}
+                    aria-expanded={!folded}
+                  >
+                    {folded ? 'EXPAND LEGION' : 'COLLAPSE LEGION'}
+                  </button>
+                </div>
+              );
+            }
+
             return (
               <div
                 key={card.tab.id}
+                ref={(el) => {
+                  if (el) cardElsRef.current.set(card.tab.id, el);
+                  else cardElsRef.current.delete(card.tab.id);
+                }}
                 data-testid={`target-card-${card.tab.id}`}
                 data-archetype={card.archetype.id}
                 data-hp={card.hp}
@@ -1103,29 +1710,76 @@ export const Arena: React.FC = () => {
             );
           })}
 
+          {DEBUG_HITBOX && (
+            <pre className="debug-panel" data-testid="debug-panel">
+{`hand ${diag.hand ?? '-'}   gesture ${diag.gesture ?? '-'}   thumb cocked ${diag.cocked ?? '-'}
+crosshair ${diag.crosshair ?? '-'}   lock ${diag.lock ?? '-'} (${diag.lockHp ?? '-'})
+${diag.thumb ?? ''}
+attacks ${diag.attacks ?? 0}  last: ${diag.source ?? '-'} ${diag.style ?? ''} ${diag.result ?? '-'} (${diag.reason ?? '-'})
+  aim ${diag.aim ?? '-'} target/tab ${diag.target ?? '-'}  dmg ${diag.dmg ?? '-'}  hp ${diag.hpBefore ?? '-'} -> ${diag.hpAfter ?? '-'}`}
+            </pre>
+          )}
+          {DEBUG_HITBOX && (
+            <svg className="arena-vfx-svg debug-hitbox" aria-hidden="true" data-testid="debug-hitbox">
+              {debugRects.map((d) => (
+                <g key={d.id} className={d.id === lockedTabId ? 'dbg-locked' : ''}>
+                  <rect x={d.ex} y={d.ey} width={d.ew} height={d.eh} className="dbg-el" />
+                  <rect x={d.sx - HIT_PAD_PX} y={d.sy - HIT_PAD_PX} width={d.sw + HIT_PAD_PX * 2} height={d.sh + HIT_PAD_PX * 2} className="dbg-pad" />
+                  <rect x={d.sx} y={d.sy} width={d.sw} height={d.sh} className="dbg-sprite" />
+                  <text x={d.sx} y={d.sy - HIT_PAD_PX - 3} className="dbg-text">{d.id}</text>
+                </g>
+              ))}
+              <text x={8} y={16} className="dbg-text">
+                crosshair {Math.round(crosshairRef.current.x)},{Math.round(crosshairRef.current.y)} lock {lockedTabId ?? 'none'}
+              </text>
+            </svg>
+          )}
+
           {/* PIXEL LASER TRAJECTORIES (WEAPON-SCALED COLOR & THICKNESS) */}
           <svg className="arena-vfx-svg" aria-hidden="true">
-            {lasers.map((beam) => (
-              <g key={beam.id}>
-                <line
-                  x1={beam.fromX}
-                  y1={beam.fromY}
-                  x2={beam.toX}
-                  y2={beam.toY}
-                  stroke={beam.hit ? beam.color : '#64748B'}
-                  strokeWidth={beam.width}
-                  strokeDasharray="12 4"
-                />
-                <line
-                  x1={beam.fromX}
-                  y1={beam.fromY}
-                  x2={beam.toX}
-                  y2={beam.toY}
-                  stroke={beam.coreColor}
-                  strokeWidth={Math.max(2, Math.floor(beam.width * 0.4))}
-                />
-              </g>
-            ))}
+            {lasers.map((beam) =>
+              beam.style === 'snap' ? (
+                <g key={beam.id} transform={`translate(${beam.toX} ${beam.toY})`}><g className="fx-snap">
+                  <circle r="52" className="fx-snap-ring" />
+                  <circle r="30" className="fx-snap-ring fx-snap-inner" />
+                  {Array.from({ length: 8 }, (_, i) => {
+                    const ang = (i / 8) * Math.PI * 2;
+                    return <rect key={i} x={Math.cos(ang) * 52 - 3} y={Math.sin(ang) * 52 - 3} width="6" height="6" className="fx-snap-rune" />;
+                  })}
+                </g></g>
+              ) : beam.style === 'blade' ? (
+                <g key={beam.id} className="fx-blade">
+                  <path
+                    d={`M ${beam.fromX} ${beam.fromY} Q ${(beam.fromX + beam.toX) / 2 - (beam.toY - beam.fromY) * 0.18} ${(beam.fromY + beam.toY) / 2 + (beam.toX - beam.fromX) * 0.18} ${beam.toX} ${beam.toY}`}
+                    className="fx-blade-trail"
+                  />
+                  <path
+                    d={`M ${beam.fromX} ${beam.fromY} Q ${(beam.fromX + beam.toX) / 2 - (beam.toY - beam.fromY) * 0.18} ${(beam.fromY + beam.toY) / 2 + (beam.toX - beam.fromX) * 0.18} ${beam.toX} ${beam.toY}`}
+                    className="fx-blade-core"
+                  />
+                </g>
+              ) : (
+                <g key={beam.id}>
+                  <line
+                    x1={beam.fromX}
+                    y1={beam.fromY}
+                    x2={beam.toX}
+                    y2={beam.toY}
+                    stroke={beam.hit ? beam.color : '#64748B'}
+                    strokeWidth={beam.width}
+                    strokeDasharray="12 4"
+                  />
+                  <line
+                    x1={beam.fromX}
+                    y1={beam.fromY}
+                    x2={beam.toX}
+                    y2={beam.toY}
+                    stroke={beam.coreColor}
+                    strokeWidth={Math.max(2, Math.floor(beam.width * 0.4))}
+                  />
+                </g>
+              )
+            )}
           </svg>
 
           {/* PIXEL PARTICLE BURSTS & FLOATING DAMAGE/SCORE NUMBERS */}
@@ -1166,19 +1820,12 @@ export const Arena: React.FC = () => {
           {/* START SCREEN OVERLAY */}
           {!raidStarted && (
             <div className="arena-overlay" data-hud-interactive="true">
-              <div className="mission-modal">
-                <div className="mission-brand-header">
-                  <PixelBrandLogo size={44} />
-                  <div>
-                    <div className="mission-eyebrow">TAB RAID // MONSTER INVASION</div>
-                    <h2 className="mission-heading">YOUR TABS HAVE MUTATED.</h2>
-                  </div>
-                </div>
-                <p className="mission-subhead">
-                  HUNT THEM. EARN CREDITS. UPGRADE YOUR BLASTER. CLEAR THE CHAOS.
-                </p>
+              <div className="mission-modal title-screen">
+                <PixelBrandLogo size={72} />
+                <h2 className="mission-heading">TABWRAITH</h2>
+                <div className="mission-eyebrow">CURSE OF THE OPEN TABS</div>
+                <p className="mission-subhead">THE TABS YOU FORGOT HAVE RETURNED.</p>
 
-                {/* 5 ARCHETYPE LEGEND */}
                 <div className="archetype-roster">
                   {([1, 2, 3, 4, 5] as const).map((tier) => {
                     const spec = MONSTER_ARCHETYPES[tier];
@@ -1193,29 +1840,17 @@ export const Arena: React.FC = () => {
                         />
                         <div className="roster-name">{spec.name}</div>
                         <div className="roster-stats">
-                          {spec.maxHp} HP // +{spec.points} CR
+                          {spec.maxHp} HP · +{spec.points}
                         </div>
                       </div>
                     );
                   })}
                 </div>
 
-                <div className="mission-instructions">
-                  <div className="instruction-card">
-                    <span className="step-num">01 // AIM</span>
-                    <p>Point your index finger at the webcam (or aim with mouse).</p>
-                  </div>
-                  <div className="instruction-card">
-                    <span className="step-num">02 // FIRE</span>
-                    <p>Raise thumb to cock, fold thumb to fire (or Click / Space).</p>
-                  </div>
-                  <div className="instruction-card">
-                    <span className="step-num">03 // ARMORY</span>
-                    <p>
-                      Spend credits in the <strong>ARMORY</strong> for 2-HP &amp; 3-HP weapons. Final
-                      blow archives &amp; closes the tab in <strong>LIVE MODE</strong>.
-                    </p>
-                  </div>
+                <div className="gesture-strip">
+                  <span><b>AIM</b> index finger / mouse</span>
+                  <span><b>FIRE</b> fold thumb / click / Space</span>
+                  <span><b>LIVE MODE</b> bookmarks, then closes</span>
                 </div>
 
                 <div className="mission-cta-row">
@@ -1228,7 +1863,7 @@ export const Arena: React.FC = () => {
                       soundFX.playStartJingle();
                     }}
                   >
-                    START RAID ({activeCardsCount} MONSTERS)
+                    START HUNT ({activeCardsCount})
                   </button>
 
                   <button
@@ -1248,9 +1883,9 @@ export const Arena: React.FC = () => {
           {raidStarted && activeCardsCount === 0 && (
             <div className="arena-overlay" data-hud-interactive="true">
               <div className="mission-modal victory-modal" data-testid="desktop-cleared-modal">
-                <div className="mission-eyebrow">SECTOR CLEARED // 0 MONSTERS REMAINING</div>
-                <h2 className="mission-heading victory-heading">DESKTOP CLEARED.</h2>
-                <p className="mission-subhead">ALL MONSTERS ELIMINATED.</p>
+                <div className="mission-eyebrow">BATTLEFIELD CLEARED · 0 CURSED TABS REMAIN</div>
+                <h2 className="mission-heading victory-heading">THE CURSE IS BROKEN.</h2>
+                <p className="mission-subhead">EVERY WRAITH LAID TO REST.</p>
 
                 <div className="victory-stats-grid">
                   <div className="v-stat">
@@ -1320,8 +1955,10 @@ export const Arena: React.FC = () => {
               <div className="crosshair-line ch-bottom" />
               <div className="crosshair-line ch-left" />
               <div className="crosshair-tag">
-                {lockedCard
-                  ? `LOCK // ${lockedCard.hp}HP (-${equippedWeapon.damage})`
+                {lockedCard?.squad
+                  ? 'LEGION BOSS (NO DAMAGE)'
+                  : lockedCard
+                  ? `LOCK · ${lockedCard.hp}HP (-${equippedWeapon.damage})`
                   : `${equippedWeapon.name.toUpperCase()} [${equippedWeapon.damage}DMG]`}
               </div>
             </div>
@@ -1335,17 +1972,14 @@ export const Arena: React.FC = () => {
           aria-label="Live Hand Tracking Camera Panel"
         >
           <div className="cam-panel-header">
-            <div>
-              <div className="cam-panel-title">OPTICAL TRACKING DECK</div>
-              <div className="cam-panel-subtitle">1-HAND DIRECT-DOM PIPELINE</div>
-            </div>
+            <div className="cam-panel-title">THE SCRYING MIRROR</div>
             <div className="cam-header-btns">
               <button
                 type="button"
                 className="hud-btn cam-expand-btn"
                 onClick={() => setShowPerfOverlay((prev) => !prev)}
                 data-testid="perf-toggle-btn"
-                title="Toggle tracking FPS & inference telemetry overlay"
+                title="Toggle tracking FPS & inference telemetry"
               >
                 {showPerfOverlay ? 'FPS: ON' : 'FPS: OFF'}
               </button>
@@ -1353,82 +1987,94 @@ export const Arena: React.FC = () => {
                 type="button"
                 className="hud-btn cam-expand-btn"
                 onClick={() => setCamExpanded((prev) => !prev)}
-                title="Toggle expanded camera view"
+                title="Toggle expanded mirror"
               >
                 {camExpanded ? 'STD' : 'EXPAND'}
               </button>
             </div>
           </div>
 
-          {/* LARGE 4:3 MIRRORED WEBCAM PREVIEW (360x270 at 1366x768) */}
-          <div className="cam-viewport-frame" data-testid="camera-viewport">
-            <video
-              ref={videoRef}
-              className="cam-video"
-              playsInline
-              muted
-              width={480}
-              height={360}
-            />
-            <canvas
-              ref={landmarkCanvasRef}
-              className="cam-canvas"
-              width={480}
-              height={360}
-            />
+          {/* ENCHANTED FRAME (decorations sit OUTSIDE the video box; pointer-events none) */}
+          <div className={`scrying-mirror ${mirrorState} mirror-mode-${combatMode}`} data-testid="camera-viewport">
+            <div className="mirror-frame">
+              <span className="mirror-rune mr-t" aria-hidden="true">ᚠ</span>
+              <span className="mirror-rune mr-r" aria-hidden="true">ᚱ</span>
+              <span className="mirror-rune mr-b" aria-hidden="true">ᛉ</span>
+              <span className="mirror-rune mr-l" aria-hidden="true">ᛟ</span>
+              <div className="cam-viewport-frame">
+                <video
+                  ref={videoRef}
+                  className="cam-video"
+                  playsInline
+                  muted
+                  width={480}
+                  height={360}
+                />
+                <canvas ref={maskCanvasRef} className="cam-canvas cam-mask" width={480} height={360} aria-hidden="true" />
+                <canvas
+                  ref={landmarkCanvasRef}
+                  className="cam-canvas"
+                  width={480}
+                  height={360}
+                />
 
-            {/* LIVE ACTIONABLE GESTURE STATE OVERLAY */}
-            <div className="cam-hud-overlay">
-              <span
-                className={`gesture-state-badge ${
-                  gestureState.statusLabel === 'FIRED'
-                    ? 'state-fired'
-                    : gestureState.statusLabel === 'READY'
-                    ? 'state-ready'
-                    : gestureState.statusLabel === 'POSE NOT RECOGNIZED'
-                    ? 'state-aiming'
-                    : 'state-nohand'
-                }`}
-                data-testid="gesture-status"
-              >
-                {gestureState.statusLabel}
-              </span>
-              <span className="input-source-badge">
-                AIM: {controlSource.toUpperCase()}
-              </span>
+                {cameraStatus !== 'active' && (
+                  <div className="cam-placeholder">
+                    <div className="cam-placeholder-icon">[ THE MIRROR SLEEPS ]</div>
+                    <div className="cam-placeholder-text">
+                      {cameraStatus === 'denied'
+                        ? 'CAMERA PERMISSION DENIED — ALLOW IT IN SITE SETTINGS'
+                        : cameraStatus === 'error'
+                        ? 'CAMERA FEED UNAVAILABLE — MOUSE & SPACE STILL WORK'
+                        : cameraStatus === 'loading-model'
+                        ? 'LOADING MEDIAPIPE WASM...'
+                        : cameraStatus === 'requesting'
+                        ? 'AWAITING PERMISSION...'
+                        : 'CAMERA STANDBY'}
+                    </div>
+                    {cameraError && <div className="cam-error-note">{cameraError}</div>}
+                  </div>
+                )}
+              </div>
+              <MirrorCorner className="mc-tl" />
+              <MirrorCorner className="mc-tr" />
+              <MirrorCorner className="mc-bl" />
+              <MirrorCorner className="mc-br" />
             </div>
+          </div>
 
-            {/* MEASURED PERFORMANCE TELEMETRY OVERLAY */}
-            {showPerfOverlay && (
-              <div className="cam-perf-overlay" data-testid="perf-overlay">
-                <span>CAM: {perfMetrics.cameraFps} FPS</span>
-                <span>TRACK: {perfMetrics.trackingFps} FPS</span>
-                <span>INFER: {perfMetrics.inferenceMs.toFixed(1)} ms ({perfMetrics.delegate})</span>
-              </div>
-            )}
-
-            {cameraStatus !== 'active' && (
-              <div className="cam-placeholder">
-                <div className="cam-placeholder-icon">[ CAM // 4:3 ]</div>
-                <div className="cam-placeholder-text">
-                  {cameraStatus === 'denied'
-                    ? 'CAMERA PERMISSION DENIED'
-                    : cameraStatus === 'error'
-                    ? 'CAMERA FEED UNAVAILABLE'
-                    : cameraStatus === 'loading-model'
-                    ? 'LOADING MEDIAPIPE WASM...'
-                    : cameraStatus === 'requesting'
-                    ? 'AWAITING PERMISSION...'
-                    : 'CAMERA STANDBY'}
-                </div>
-                {cameraError && <div className="cam-error-note">{cameraError}</div>}
-              </div>
-            )}
+          {/* STATUS PLATE (outside the video so the hand is never covered) */}
+          <div className="mirror-plate">
+            <span
+              className={`gesture-state-badge ${
+                gestureState.statusLabel === 'FIRED'
+                  ? 'state-fired'
+                  : READY_LABELS.has(gestureState.statusLabel)
+                  ? 'state-ready'
+                  : gestureState.statusLabel === 'POSE NOT RECOGNIZED'
+                  ? 'state-aiming'
+                  : 'state-nohand'
+              }`}
+              data-testid="gesture-status"
+            >
+              {gestureState.statusLabel}
+            </span>
+            <span className="input-source-badge">AIM: {controlSource.toUpperCase()}</span>
           </div>
 
           <div className="gesture-action-hint" data-testid="gesture-detail-hint">
             {gestureState.detailHint}
           </div>
+
+          <RelicSelector
+            value={relic}
+            onSelect={selectRelic}
+            status={
+              relic === 'off' ? 'off' : cameraStatus !== 'active' ? 'camera-off' : faceSeen ? 'tracking' : ('searching' as FaceStatus)
+            }
+          />
+
+          <CombatSelector mode={combatMode} onSelect={selectCombatMode} />
 
           {/* CAMERA ENABLE / DISABLE CONTROLS */}
           <div className="cam-control-bar">
@@ -1478,20 +2124,32 @@ export const Arena: React.FC = () => {
               className="hud-btn full-width-btn"
               onClick={() => setArmoryOpen((prev) => !prev)}
             >
-              {armoryOpen ? 'CLOSE ARMORY' : `OPEN ARMORY (${credits} CR)`}
+              {armoryOpen ? 'CLOSE BLACKSMITH' : `OPEN BLACKSMITH (${credits} CR)`}
             </button>
           </div>
 
           {/* COMPACT CONTROLS & THREAT TABLE INFO POPOVER */}
+          <details className="mirror-details">
+            <summary>TRACKING DETAILS &amp; CONTROLS</summary>
+            {showPerfOverlay && (
+              <div className="cam-perf-overlay" data-testid="perf-overlay">
+                <span>CAM: {perfMetrics.cameraFps} FPS</span>
+                <span>TRACK: {perfMetrics.trackingFps} FPS</span>
+                <span>INFER: {perfMetrics.inferenceMs.toFixed(1)} ms ({perfMetrics.delegate})</span>
+                {faceStats && (
+                  <span>
+                    RELIC: {faceStats.fps} FPS · {faceStats.ms} ms · every {faceStats.intervalMs} ms
+                  </span>
+                )}
+              </div>
+            )}
           <div className="gesture-guide-box">
-            <div className="guide-row">
-              <span className="guide-key">INDEX FINGER</span>
-              <span className="guide-val lime-text">AIM CROSSHAIR</span>
-            </div>
-            <div className="guide-row">
-              <span className="guide-key">THUMB UP / FOLD</span>
-              <span className="guide-val">COCK / FIRE SHOT</span>
-            </div>
+            {COMBAT_MODES.find((c) => c.id === combatMode)!.guide.map(([k, v]) => (
+              <div className="guide-row" key={k}>
+                <span className="guide-key">{k}</span>
+                <span className="guide-val">{v}</span>
+              </div>
+            ))}
             <div className="guide-row">
               <span className="guide-key">MOUSE + [SPACE]</span>
               <span className="guide-val">INSTANT FALLBACK</span>
@@ -1525,6 +2183,7 @@ export const Arena: React.FC = () => {
               </div>
             )}
           </div>
+          </details>
         </aside>
       </div>
     </div>

@@ -23,57 +23,57 @@ export interface MonsterArchetypeSpec {
 export const MONSTER_ARCHETYPES: Record<ThreatTier, MonsterArchetypeSpec> = {
   1: {
     id: 'glitch-slime',
-    name: 'Glitch Slime',
+    name: 'Ashling',
     tier: 1,
     maxHp: 1,
     points: 100,
-    primaryColor: '#A3E635',
-    secondaryColor: '#4D7C0F',
-    eyeColor: '#090D16',
+    primaryColor: '#7BAA9B',
+    secondaryColor: '#3F6359',
+    eyeColor: '#B44653',
     spriteSizePx: 68,
   },
   2: {
     id: 'byte-bat',
-    name: 'Byte Bat',
+    name: 'Gloomwing',
     tier: 2,
     maxHp: 2,
     points: 250,
-    primaryColor: '#38BDF8',
-    secondaryColor: '#0369A1',
-    eyeColor: '#FACC15',
+    primaryColor: '#7A6A9B',
+    secondaryColor: '#3E3258',
+    eyeColor: '#CA955C',
     spriteSizePx: 76,
   },
   3: {
     id: 'cache-crawler',
-    name: 'Cache Crawler',
+    name: 'Crypt Crawler',
     tier: 3,
     maxHp: 3,
     points: 450,
-    primaryColor: '#F59E0B',
-    secondaryColor: '#B45309',
-    eyeColor: '#EF4444',
+    primaryColor: '#B3A27E',
+    secondaryColor: '#5E4F38',
+    eyeColor: '#B44653',
     spriteSizePx: 82,
   },
   4: {
     id: 'ram-reaper',
-    name: 'RAM Reaper',
+    name: 'Soul Reaper',
     tier: 4,
     maxHp: 4,
     points: 700,
-    primaryColor: '#E2E8F0',
-    secondaryColor: '#64748B',
-    eyeColor: '#FF3B5C',
+    primaryColor: '#E9DFCF',
+    secondaryColor: '#8A7F73',
+    eyeColor: '#7BAA9B',
     spriteSizePx: 90,
   },
   5: {
     id: 'browser-behemoth',
-    name: 'Browser Behemoth',
+    name: 'Abyssal Behemoth',
     tier: 5,
     maxHp: 5,
     points: 1000,
-    primaryColor: '#FF4D4D',
-    secondaryColor: '#991B1B',
-    eyeColor: '#CCFF00',
+    primaryColor: '#B44653',
+    secondaryColor: '#5C1F2B',
+    eyeColor: '#CA955C',
     spriteSizePx: 104,
   },
 };
@@ -282,13 +282,13 @@ const SPRITE_FRAMES: Record<MonsterArchetypeId, [string[], string[]]> = {
 
 // Slight deterministic color variation seeded by tabId so monsters of the same tier have subtle identity
 const ACCENT_PALETTES: Array<{ p: string; s: string }> = [
-  { p: '#A3E635', s: '#4D7C0F' },
-  { p: '#38BDF8', s: '#0369A1' },
-  { p: '#F59E0B', s: '#B45309' },
-  { p: '#E2E8F0', s: '#64748B' },
-  { p: '#FF4D4D', s: '#991B1B' },
-  { p: '#2DD4BF', s: '#0F766E' },
-  { p: '#FB923C', s: '#9A3412' },
+  { p: '#7BAA9B', s: '#3F6359' },
+  { p: '#8F7FB0', s: '#3E3258' },
+  { p: '#B3A27E', s: '#5E4F38' },
+  { p: '#A89B8C', s: '#4A3F57' },
+  { p: '#B44653', s: '#5C1F2B' },
+  { p: '#6F8F8A', s: '#2F4A47' },
+  { p: '#CA955C', s: '#6B4A28' },
 ];
 
 interface PixelMonsterSpriteProps {
@@ -324,9 +324,9 @@ export const PixelMonsterSprite: React.FC<PixelMonsterSpriteProps> = React.memo(
         case 'S':
           return secondary;
         case 'E':
-          return isLocked ? '#CCFF00' : spec.eyeColor;
+          return isLocked ? '#CA955C' : spec.eyeColor;
         case 'W':
-          return '#F8FAFC';
+          return '#E9DFCF';
         default:
           return null;
       }

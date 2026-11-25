@@ -10,7 +10,30 @@ export interface RaidTab {
   discarded?: boolean;
   estThreatTier: ThreatTier;
   isMock?: boolean;
+  groupId?: number; // ephemeral native group id: runtime only, never persisted
+  index?: number; // browser tab order (within its window)
+  windowId?: number;
 }
+
+export interface RaidGroup {
+  id: number; // ephemeral native group id
+  title: string;
+  color: string; // chrome.tabGroups color name
+  collapsed?: boolean; // native collapsed state
+  windowId?: number;
+}
+
+export const GROUP_COLORS: Record<string, string> = {
+  grey: '#94A3B8',
+  blue: '#38BDF8',
+  red: '#FF4D4D',
+  yellow: '#FACC15',
+  green: '#A3E635',
+  pink: '#F472B6',
+  purple: '#A78BFA',
+  cyan: '#22D3EE',
+  orange: '#FB923C',
+};
 
 export interface ClosedTabRecord {
   tab: RaidTab;
@@ -18,7 +41,8 @@ export interface ClosedTabRecord {
   closedAt: number;
 }
 
-const ARCHIVE_FOLDER_TITLE = 'TAB RAID Archive';
+const ARCHIVE_FOLDER_TITLE = 'TABWRAITH Archive';
+const LEGACY_ARCHIVE_FOLDER_TITLE = 'TAB RAID Archive'; // v4 folder: reused so upgrades keep one archive
 
 /**
  * Deterministic heuristic for ESTIMATED RESOURCE THREAT TIER (1..5).
@@ -103,6 +127,7 @@ const MOCK_TABS: RaidTab[] = [
     discarded: true,
     estThreatTier: 1,
     isMock: true,
+    groupId: 2,
   },
   {
     id: 9002,
@@ -111,6 +136,7 @@ const MOCK_TABS: RaidTab[] = [
     domain: 'stackoverflow.com',
     estThreatTier: 2,
     isMock: true,
+    groupId: 2,
   },
   {
     id: 9003,
@@ -127,6 +153,7 @@ const MOCK_TABS: RaidTab[] = [
     domain: 'localhost:5173',
     estThreatTier: 3,
     isMock: true,
+    groupId: 1,
   },
   {
     id: 9005,
@@ -135,6 +162,7 @@ const MOCK_TABS: RaidTab[] = [
     domain: 'github.com',
     estThreatTier: 4,
     isMock: true,
+    groupId: 1,
   },
   {
     id: 9006,
@@ -143,6 +171,7 @@ const MOCK_TABS: RaidTab[] = [
     domain: 'docs.google.com',
     estThreatTier: 4,
     isMock: true,
+    groupId: 1,
   },
   {
     id: 9007,
@@ -161,6 +190,19 @@ const MOCK_TABS: RaidTab[] = [
     estThreatTier: 5,
     isMock: true,
   },
+  {
+    id: 9009,
+    title: 'Hacker News - Ask HN: How many browser tabs do you have open right now?',
+    url: 'https://news.ycombinator.com/item?id=40291821',
+    domain: 'news.ycombinator.com',
+    estThreatTier: 2,
+    isMock: true,
+  },
+];
+
+const MOCK_GROUPS: RaidGroup[] = [
+  { id: 1, title: 'DEVFEST', color: 'blue' },
+  { id: 2, title: 'REFERENCE', color: 'green' },
 ];
 
 export function isChromeExtensionEnv(): boolean {
@@ -206,10 +248,16 @@ export function isEligibleRaidTab(tab: chrome.tabs.Tab, currentArenaTabId?: numb
   return true;
 }
 
-export async function queryRaidTargets(): Promise<{ tabs: RaidTab[]; usingRealTabs: boolean }> {
-  if (!isChromeExtensionEnv()) {
-    return { tabs: [...MOCK_TABS], usingRealTabs: false };
-  }
+export interface RaidQuery {
+  tabs: RaidTab[];
+  groups: RaidGroup[];
+  usingRealTabs: boolean;
+}
+
+const mockQuery = (): RaidQuery => ({ tabs: [...MOCK_TABS], groups: [...MOCK_GROUPS], usingRealTabs: false });
+
+export async function queryRaidTargets(): Promise<RaidQuery> {
+  if (!isChromeExtensionEnv()) return mockQuery();
 
   try {
     const currentTab = await chrome.tabs.getCurrent();
@@ -233,23 +281,40 @@ export async function queryRaidTargets(): Promise<{ tabs: RaidTab[]; usingRealTa
           discarded,
           estThreatTier: estimateTabThreatTier({ url, title, audible, discarded }),
           isMock: false,
+          groupId: t.groupId !== undefined && t.groupId >= 0 ? t.groupId : undefined,
+          index: t.index,
+          windowId: t.windowId,
         };
       });
 
     if (eligible.length > 0) {
-      return { tabs: eligible, usingRealTabs: true };
+      const groupIds = new Set(eligible.map((t) => t.groupId).filter((g): g is number => g !== undefined));
+      const groups: RaidGroup[] = [];
+      for (const id of groupIds) {
+        try {
+          const g = await chrome.tabGroups.get(id);
+          groups.push({ id, title: g.title || 'UNNAMED LEGION', color: g.color, collapsed: g.collapsed, windowId: g.windowId });
+        } catch {
+          // group vanished mid-query: members become ungrouped
+          eligible.forEach((t) => t.groupId === id && (t.groupId = undefined));
+        }
+      }
+      return { tabs: eligible, groups, usingRealTabs: true };
     }
 
-    return { tabs: [...MOCK_TABS], usingRealTabs: false };
+    return mockQuery();
   } catch (err) {
-    console.warn('[TAB RAID] Falling back to simulated targets:', err);
-    return { tabs: [...MOCK_TABS], usingRealTabs: false };
+    console.warn('[TABWRAITH] Falling back to simulated targets:', err);
+    return mockQuery();
   }
 }
 
-async function getOrCreateArchiveFolderId(): Promise<string> {
-  const existing = await chrome.bookmarks.search({ title: ARCHIVE_FOLDER_TITLE });
-  const folder = existing.find((node) => !node.url);
+export async function getOrCreateArchiveFolderId(): Promise<string> {
+  const found = [
+    ...(await chrome.bookmarks.search({ title: ARCHIVE_FOLDER_TITLE })),
+    ...(await chrome.bookmarks.search({ title: LEGACY_ARCHIVE_FOLDER_TITLE })),
+  ];
+  const folder = found.find((node) => !node.url);
   if (folder?.id) {
     return folder.id;
   }
@@ -291,7 +356,7 @@ export async function archiveAndCloseTab(
     const folderId = await getOrCreateArchiveFolderId();
     const bookmark = await chrome.bookmarks.create({
       parentId: folderId,
-      title: `[TAB RAID] ${tab.title}`,
+      title: `[TABWRAITH] ${tab.title}`,
       url: tab.url,
     });
 
@@ -321,6 +386,68 @@ export async function archiveAndCloseTab(
   }
 }
 
+/**
+ * Bulk archive-then-close (group cleanup / duplicates). Bookmarks EVERY tab first;
+ * if any archive fails nothing is closed. SAFE MODE / mock tabs are never touched.
+ */
+export async function archiveAndCloseMany(
+  tabs: RaidTab[],
+  liveMode: boolean
+): Promise<{ success: boolean; records: ClosedTabRecord[]; error?: string }> {
+  if (!liveMode) return { success: false, records: [], error: 'LIVE MODE REQUIRED' };
+  const real = tabs.filter((t) => !t.isMock);
+  if (real.length === 0 || !isChromeExtensionEnv()) return { success: false, records: [], error: 'NO REAL TABS' };
+  try {
+    const folderId = await getOrCreateArchiveFolderId();
+    const records: ClosedTabRecord[] = [];
+    for (const tab of real) {
+      const bm = await chrome.bookmarks.create({ parentId: folderId, title: `[TABWRAITH] ${tab.title}`, url: tab.url });
+      if (!bm?.id) throw new Error('Bookmark archive failed; no tabs were closed.');
+      records.push({ tab, bookmarkId: bm.id, closedAt: Date.now() });
+    }
+    await chrome.tabs.remove(real.map((t) => t.id));
+    return { success: true, records };
+  } catch (err) {
+    return { success: false, records: [], error: err instanceof Error ? err.message : 'Archive failed' };
+  }
+}
+
+/** Folds/unfolds the native browser tab group (no tab is opened or closed). */
+export async function setNativeGroupCollapsed(groupId: number, collapsed: boolean): Promise<boolean> {
+  try {
+    await chrome.tabGroups.update(groupId, { collapsed });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Calls onChange (debounced) when tabs/groups change in the browser. Returns an unsubscribe fn. */
+export function subscribeTabChanges(onChange: () => void, delayMs = 450): () => void {
+  if (!isChromeExtensionEnv()) return () => {};
+  let timer = 0;
+  const fire = () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(onChange, delayMs);
+  };
+  const emitters = [
+    chrome.tabs.onCreated,
+    chrome.tabs.onRemoved,
+    chrome.tabs.onMoved,
+    chrome.tabs.onAttached,
+    chrome.tabs.onDetached,
+    chrome.tabs.onUpdated,
+    chrome.tabGroups?.onUpdated,
+    chrome.tabGroups?.onCreated,
+    chrome.tabGroups?.onRemoved,
+  ].filter(Boolean) as Array<chrome.events.Event<(...args: never[]) => void>>;
+  emitters.forEach((e) => e.addListener(fire));
+  return () => {
+    window.clearTimeout(timer);
+    emitters.forEach((e) => e.removeListener(fire));
+  };
+}
+
 export async function restoreClosedTab(
   record: ClosedTabRecord,
   liveMode: boolean
@@ -334,6 +461,14 @@ export async function restoreClosedTab(
       url: record.tab.url,
       active: false,
     });
+
+    if (record.tab.groupId !== undefined && createdTab.id !== undefined) {
+      try {
+        await chrome.tabs.group({ tabIds: createdTab.id, groupId: record.tab.groupId });
+      } catch {
+        // group no longer exists; tab stays ungrouped
+      }
+    }
 
     if (record.bookmarkId && chrome.bookmarks) {
       try {

@@ -8,6 +8,9 @@ export type ActionableGestureState =
   | 'NO HAND'
   | 'POSE NOT RECOGNIZED'
   | 'READY'
+  | 'FIST DETECTED'
+  | 'SPELL ARMED'
+  | 'SWORD READY'
   | 'FIRED';
 
 export interface GestureFrameResult {
@@ -21,6 +24,12 @@ export interface GestureFrameResult {
   statusLabel: ActionableGestureState;
   detailHint: string;
   poseConfidence: number;
+  // Aim ~140ms before the trigger: folding the thumb nudges the index fingertip, so shots use this
+  fireAimX?: number;
+  fireAimY?: number;
+  // raw trigger numbers for ?debug diagnostics
+  thumbClearance?: number;
+  thumbExtension?: number;
 }
 
 const FIRE_COOLDOWN_MS = 420;
@@ -43,6 +52,10 @@ export class GestureEngine {
   private poseHoldFrames = 0;
   private cockedFrames = 0;
   private foldedFrames = 0;
+  private aimHist: Array<{ t: number; x: number; y: number }> = [];
+  private lastGunPoseMs = -1e9;
+  // counters for ?debug: they tell cocking problems (folds with no cock) from firing problems
+  public stats = { cocks: 0, fires: 0, foldsWithoutCock: 0, poseDrops: 0 };
 
   // Base alpha tuned for crisp 1€-filter-inspired velocity response
   private readonly baseAlpha = 0.42;
@@ -53,6 +66,14 @@ export class GestureEngine {
     this.poseHoldFrames = 0;
     this.cockedFrames = 0;
     this.foldedFrames = 0;
+    this.aimHist = [];
+    this.lastGunPoseMs = -1e9;
+  }
+
+  private aimAt(t: number): { x: number; y: number } {
+    let pick = this.aimHist[0];
+    for (const s of this.aimHist) if (s.t <= t) pick = s;
+    return pick ? { x: pick.x, y: pick.y } : { x: this.smoothedX, y: this.smoothedY };
   }
 
   public processLandmarks(
@@ -66,6 +87,12 @@ export class GestureEngine {
     if (!landmarks || landmarks.length < 21) {
       this.poseHoldFrames = 0;
       this.foldedFrames = 0;
+      // tracking lost: a stale cock must not fire when the hand comes back (short blips are tolerated)
+      if (nowMs - this.lastGunPoseMs > 300) {
+        if (this.wasThumbCocked) this.stats.poseDrops++;
+        this.wasThumbCocked = false;
+        this.cockedFrames = 0;
+      }
       return {
         handDetected: false,
         isFingerGunPose: false,
@@ -123,6 +150,9 @@ export class GestureEngine {
       this.smoothedX += (mappedX - this.smoothedX) * dynamicAlpha;
       this.smoothedY += (mappedY - this.smoothedY) * dynamicAlpha;
     }
+
+    this.aimHist.push({ t: nowMs, x: this.smoothedX, y: this.smoothedY });
+    while (this.aimHist.length > 1 && nowMs - this.aimHist[0].t > 700) this.aimHist.shift();
 
     // 2. Orientation-agnostic index finger extension check
     const indexTipDist = distance3D(wrist, indexTip);
@@ -186,31 +216,40 @@ export class GestureEngine {
     const isThumbFoldedRaw =
       thumbClearance < 0.44 || thumbTip.y > indexMcp.y + palmScale * 0.1;
 
-    if (isFingerGunPose) {
+    // A thumb fold can briefly disturb the other landmarks and drop the pose for a few frames.
+    // Keep the trigger context alive for 250ms so that dropout cannot swallow the shot.
+    if (isFingerGunPose) this.lastGunPoseMs = nowMs;
+    const gunContext = isFingerGunPose || nowMs - this.lastGunPoseMs <= 250;
+
+    if (gunContext) {
       if (isThumbRaisedRaw) {
         this.cockedFrames++;
         this.foldedFrames = 0;
-        if (this.cockedFrames >= 1) {
-          this.wasThumbCocked = true;
-        }
+        if (!this.wasThumbCocked) this.stats.cocks++;
+        this.wasThumbCocked = true;
       } else if (isThumbFoldedRaw) {
+        if (this.foldedFrames === 0 && !this.wasThumbCocked && isFingerGunPose) this.stats.foldsWithoutCock++;
         this.foldedFrames++;
         this.cockedFrames = 0;
       }
     } else {
+      if (this.wasThumbCocked) this.stats.poseDrops++;
       this.cockedFrames = 0;
       this.foldedFrames = 0;
       this.wasThumbCocked = false;
     }
 
     let thumbFiredThisFrame = false;
+    let fireAim: { x: number; y: number } | null = null;
     if (
-      isFingerGunPose &&
+      gunContext &&
       this.wasThumbCocked &&
       this.foldedFrames >= 1 &&
       cooldownRemaining <= 0
     ) {
       thumbFiredThisFrame = true;
+      this.stats.fires++;
+      fireAim = this.aimAt(nowMs - 140);
       this.lastFireTimestamp = nowMs;
       this.wasThumbCocked = false;
       this.foldedFrames = 0;
@@ -222,12 +261,12 @@ export class GestureEngine {
 
     if (thumbFiredThisFrame || timeSinceFire < FIRED_BADGE_HOLD_MS) {
       statusLabel = 'FIRED';
-      detailHint = 'SHOT DISPATCHED // RAISE THUMB TO RE-COCK';
+      detailHint = 'SHOT DISPATCHED · RAISE THUMB TO RE-COCK';
     } else if (isFingerGunPose) {
       statusLabel = 'READY';
       detailHint = this.wasThumbCocked
-        ? 'LOCKED // FOLD THUMB DOWN TO FIRE'
-        : 'AIMING // RAISE THUMB TO COCK TRIGGER';
+        ? 'LOCKED · FOLD THUMB DOWN TO FIRE'
+        : 'AIMING · RAISE THUMB TO COCK TRIGGER';
     }
 
     const poseConfidence = isFingerGunPose
@@ -247,6 +286,10 @@ export class GestureEngine {
       statusLabel,
       detailHint,
       poseConfidence,
+      fireAimX: fireAim?.x,
+      fireAimY: fireAim?.y,
+      thumbClearance,
+      thumbExtension,
     };
   }
 }
